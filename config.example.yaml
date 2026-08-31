@@ -1,0 +1,35 @@
+# 当前 MVP 以环境变量为唯一运行时配置源；本文件用于展示完整配置结构。
+# 字段与 .env.example 一一对应，后续可由配置适配器直接加载。
+coordinator:
+  database_path: data/hermes.db
+  director_api_key: ${HERMES_DIRECTOR_API_KEY}
+  worker_shared_secret: ${HERMES_WORKER_SHARED_SECRET}
+  worker_secrets: {}
+  worker_stale_seconds: 45
+  task_lease_seconds: 30
+  hmac_max_clock_skew_seconds: 300
+  default_task_timeout_seconds: 900
+  max_task_timeout_seconds: 7200
+  default_max_attempts: 2
+  maintenance_interval_seconds: 5
+
+worker:
+  coordinator_url: http://127.0.0.1:8000
+  id: macbook-worker-01
+  name: MacBook Worker 01
+  command: [hermes, chat, -q, "{prompt}"]
+  allowed_workdir: /absolute/path/to/allowed/workspace
+  concurrency: 1
+  task_timeout_seconds: 900
+  heartbeat_interval_seconds: 10
+  poll_interval_seconds: 2
+
+telegram:
+  enabled: false
+  bot_token: ${HERMES_TELEGRAM_BOT_TOKEN}
+  allowed_user_ids: [123456789]
+  coordinator_url: http://127.0.0.1:8000
+  director_api_key: ${HERMES_DIRECTOR_API_KEY}
+  poll_timeout_seconds: 25
+  notification_interval_seconds: 3
+  offset_path: data/telegram.offset

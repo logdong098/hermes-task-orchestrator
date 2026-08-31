@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=58"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes"
+version = "0.1.0"
+description = "Telegram Director and distributed Worker orchestration for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
+    "pydantic>=2.9,<3",
+    "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+hermes-coordinator = "hermes.coordinator:main"
+hermes-worker = "hermes.worker:main"
+hermes-telegram = "hermes.telegram_bot:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]

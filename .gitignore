@@ -1,0 +1,13 @@
+.env
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.db
+*.db-shm
+*.db-wal
+.ruff_cache/
+.pytest_cache/
+data/*
+!data/.gitkeep

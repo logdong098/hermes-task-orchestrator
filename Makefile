@@ -1,0 +1,34 @@
+PYTHON ?= python3
+PYTHON_ENV = PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src
+
+.PHONY: install install-dev coordinator worker mock-worker telegram test lint format-check e2e
+
+install:
+	$(PYTHON) -m pip install --no-build-isolation -e .
+
+install-dev:
+	$(PYTHON) -m pip install --no-build-isolation -e '.[dev]'
+
+coordinator:
+	$(PYTHON_ENV) $(PYTHON) -m hermes.coordinator --host 127.0.0.1 --port 8000
+
+worker:
+	$(PYTHON_ENV) $(PYTHON) -m hermes.worker
+
+mock-worker:
+	HERMES_WORKER_COMMAND='$(PYTHON) -m hermes.mock_hermes -q {prompt}' $(PYTHON_ENV) $(PYTHON) -m hermes.worker
+
+telegram:
+	$(PYTHON_ENV) $(PYTHON) -m hermes.telegram_bot
+
+test:
+	$(PYTHON_ENV) $(PYTHON) -m unittest discover -s tests -v
+
+lint:
+	$(PYTHON) -m ruff check .
+
+format-check:
+	$(PYTHON) -m ruff format --check .
+
+e2e:
+	$(PYTHON_ENV) $(PYTHON) scripts/e2e_mock.py

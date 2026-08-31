@@ -1,0 +1,56 @@
+services:
+  coordinator:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      HERMES_DATABASE_PATH: /data/hermes.db
+      HERMES_DIRECTOR_API_KEY: ${HERMES_DIRECTOR_API_KEY:?set HERMES_DIRECTOR_API_KEY}
+      HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
+    volumes:
+      - hermes-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    profiles: ["worker"]
+    build: .
+    restart: unless-stopped
+    command: ["hermes-worker"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      HERMES_COORDINATOR_URL: http://coordinator:8000
+      HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
+      HERMES_WORKER_ID: ${HERMES_WORKER_ID:-docker-worker}
+      HERMES_WORKER_NAME: ${HERMES_WORKER_NAME:-Docker Mock Worker}
+      HERMES_WORKER_COMMAND: ${HERMES_WORKER_COMMAND:-python -m hermes.mock_hermes -q {prompt}}
+      HERMES_WORKER_ALLOWED_WORKDIR: /workspace
+      HERMES_WORKER_CONCURRENCY: ${HERMES_WORKER_CONCURRENCY:-1}
+    volumes:
+      - ./workspace:/workspace
+
+  telegram:
+    profiles: ["telegram"]
+    build: .
+    restart: unless-stopped
+    command: ["hermes-telegram"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      HERMES_COORDINATOR_URL: http://coordinator:8000
+      HERMES_DIRECTOR_API_KEY: ${HERMES_DIRECTOR_API_KEY:?set HERMES_DIRECTOR_API_KEY}
+      HERMES_TELEGRAM_BOT_TOKEN: ${HERMES_TELEGRAM_BOT_TOKEN:?set HERMES_TELEGRAM_BOT_TOKEN}
+      HERMES_TELEGRAM_ALLOWED_USER_IDS: ${HERMES_TELEGRAM_ALLOWED_USER_IDS:?set HERMES_TELEGRAM_ALLOWED_USER_IDS}
+      HERMES_TELEGRAM_OFFSET_PATH: /data/telegram.offset
+    volumes:
+      - hermes-data:/data
+
+volumes:
+  hermes-data:
