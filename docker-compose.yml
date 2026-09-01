@@ -8,6 +8,10 @@ services:
       HERMES_DATABASE_PATH: /data/hermes.db
       HERMES_DIRECTOR_API_KEY: ${HERMES_DIRECTOR_API_KEY:?set HERMES_DIRECTOR_API_KEY}
       HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
+      HERMES_PLANNER_DEFAULT_AGENT: ${HERMES_PLANNER_DEFAULT_AGENT:-codex}
+      # 基础镜像不内置 Codex/Claude；默认 mock 仅用于本地 Compose 验证。
+      # 生产环境必须覆盖此值并使用包含真实 Planner CLI 的受控镜像。
+      HERMES_PLANNER_COMMANDS_JSON: '${HERMES_PLANNER_COMMANDS_JSON:-{"codex":["python","-m","hermes.mock_hermes","-q","{prompt}"]}}'
     volumes:
       - hermes-data:/data
     healthcheck:
@@ -35,6 +39,40 @@ services:
     volumes:
       - ./workspace:/workspace
 
+  # M1 headless Gateway Worker。仅用于 Gateway 与 Docker 主机可达的环境；
+  # Linux 上 Hermes 若只绑定 127.0.0.1，容器无法通过 host-gateway 访问。
+  # 生产部署通常在宿主机直接运行，以使用宿主机的 keychain 和 Hermes CLI。
+  gateway-worker:
+    profiles: ["gateway-worker"]
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "hermes.gateway_worker"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HERMES_COORDINATOR_URL: http://coordinator:8000
+      HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
+      HERMES_GATEWAY_WORKER_ID: ${HERMES_GATEWAY_WORKER_ID:-docker-gateway-worker}
+      HERMES_GATEWAY_WORKER_NAME: ${HERMES_GATEWAY_WORKER_NAME:-Docker Gateway Worker}
+      HERMES_GATEWAY_URL: ${HERMES_GATEWAY_URL:-http://host.docker.internal:8642}
+      HERMES_GATEWAY_ID: ${HERMES_GATEWAY_ID:-docker-host-hermes}
+      HERMES_GATEWAY_KIND: ${HERMES_GATEWAY_KIND:-local}
+      HERMES_GATEWAY_TOKEN: ${HERMES_GATEWAY_TOKEN:-}
+      HERMES_GATEWAY_PROFILE_KEYS_JSON: ${HERMES_GATEWAY_PROFILE_KEYS_JSON:-{}}
+      HERMES_GATEWAY_PROFILES: ${HERMES_GATEWAY_PROFILES:-default}
+      HERMES_GATEWAY_DEFAULT_PROFILE: ${HERMES_GATEWAY_DEFAULT_PROFILE:-default}
+      HERMES_GATEWAY_DEFAULT_AGENT: ${HERMES_GATEWAY_DEFAULT_AGENT:-hermes}
+      HERMES_GATEWAY_WORKER_CONCURRENCY: ${HERMES_GATEWAY_WORKER_CONCURRENCY:-1}
+      HERMES_GATEWAY_TASK_TIMEOUT_SECONDS: ${HERMES_GATEWAY_TASK_TIMEOUT_SECONDS:-900}
+      HERMES_GATEWAY_HEARTBEAT_INTERVAL_SECONDS: ${HERMES_GATEWAY_HEARTBEAT_INTERVAL_SECONDS:-10}
+      HERMES_GATEWAY_WORKER_POLL_INTERVAL_SECONDS: ${HERMES_GATEWAY_WORKER_POLL_INTERVAL_SECONDS:-2}
+      HERMES_GATEWAY_POLL_INTERVAL_SECONDS: ${HERMES_GATEWAY_POLL_INTERVAL_SECONDS:-2}
+      HERMES_GATEWAY_REQUEST_TIMEOUT_SECONDS: ${HERMES_GATEWAY_REQUEST_TIMEOUT_SECONDS:-30}
+      HERMES_GATEWAY_STOP_WAIT_SECONDS: ${HERMES_GATEWAY_STOP_WAIT_SECONDS:-30}
+
   telegram:
     profiles: ["telegram"]
     build: .
@@ -46,8 +84,10 @@ services:
     environment:
       HERMES_COORDINATOR_URL: http://coordinator:8000
       HERMES_DIRECTOR_API_KEY: ${HERMES_DIRECTOR_API_KEY:?set HERMES_DIRECTOR_API_KEY}
-      HERMES_TELEGRAM_BOT_TOKEN: ${HERMES_TELEGRAM_BOT_TOKEN:?set HERMES_TELEGRAM_BOT_TOKEN}
-      HERMES_TELEGRAM_ALLOWED_USER_IDS: ${HERMES_TELEGRAM_ALLOWED_USER_IDS:?set HERMES_TELEGRAM_ALLOWED_USER_IDS}
+      # Profile 未启用时保持为空，避免 `docker compose up coordinator`
+      # 被 Telegram 专用变量阻断；telegram 进程启动后会自行校验。
+      HERMES_TELEGRAM_BOT_TOKEN: ${HERMES_TELEGRAM_BOT_TOKEN:-}
+      HERMES_TELEGRAM_ALLOWED_USER_IDS: ${HERMES_TELEGRAM_ALLOWED_USER_IDS:-}
       HERMES_TELEGRAM_OFFSET_PATH: /data/telegram.offset
     volumes:
       - hermes-data:/data

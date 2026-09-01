@@ -1,7 +1,7 @@
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PYTHON_ENV = PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src
 
-.PHONY: install install-dev coordinator worker mock-worker telegram test lint format-check e2e
+.PHONY: install install-dev coordinator worker gateway-worker mock-worker telegram test lint format-check e2e e2e-command e2e-gateway
 
 install:
 	$(PYTHON) -m pip install --no-build-isolation -e .
@@ -14,6 +14,9 @@ coordinator:
 
 worker:
 	$(PYTHON_ENV) $(PYTHON) -m hermes.worker
+
+gateway-worker:
+	$(PYTHON_ENV) $(PYTHON) -m hermes.gateway_worker
 
 mock-worker:
 	HERMES_WORKER_COMMAND='$(PYTHON) -m hermes.mock_hermes -q {prompt}' $(PYTHON_ENV) $(PYTHON) -m hermes.worker
@@ -30,5 +33,10 @@ lint:
 format-check:
 	$(PYTHON) -m ruff format --check .
 
-e2e:
+e2e: e2e-command e2e-gateway
+
+e2e-command:
 	$(PYTHON_ENV) $(PYTHON) scripts/e2e_mock.py
+
+e2e-gateway:
+	$(PYTHON_ENV) $(PYTHON) scripts/e2e_gateway_mock.py

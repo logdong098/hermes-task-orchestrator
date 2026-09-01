@@ -12,17 +12,51 @@ coordinator:
   max_task_timeout_seconds: 7200
   default_max_attempts: 2
   maintenance_interval_seconds: 5
+  planner:
+    default_agent: codex
+    commands:
+      claude: [claude, --permission-mode, plan, -p, "{prompt}"]
+      codex: [codex, exec, --sandbox, read-only, "{prompt}"]
+    timeout_seconds: 900
+    poll_interval_seconds: 2
+    lease_seconds: 30
+    max_attempts: 2
+    max_output_bytes: 2000000
 
 worker:
   coordinator_url: http://127.0.0.1:8000
   id: macbook-worker-01
   name: MacBook Worker 01
   command: [hermes, chat, -q, "{prompt}"]
+  default_agent: default
+  agent_commands: {}
   allowed_workdir: /absolute/path/to/allowed/workspace
   concurrency: 1
   task_timeout_seconds: 900
   heartbeat_interval_seconds: 10
   poll_interval_seconds: 2
+
+# M1 无 GUI Gateway Worker；与普通 worker 分开运行并使用不同 worker id。
+gateway_worker:
+  coordinator_url: http://127.0.0.1:8000
+  id: hermes-gateway-worker-01
+  name: Hermes Gateway Worker 01
+  gateway_url: http://127.0.0.1:8642
+  gateway_id: local-hermes
+  gateway_kind: local
+  gateway_token: ${HERMES_GATEWAY_TOKEN}
+  # 不要把真实 key 提交到仓库；生产环境使用受限 env/secret file。
+  profile_keys: {}
+  profiles: [default]
+  default_profile: default
+  default_agent: hermes
+  concurrency: 1
+  task_timeout_seconds: 900
+  heartbeat_interval_seconds: 10
+  poll_interval_seconds: 2
+  gateway_poll_interval_seconds: 2
+  gateway_request_timeout_seconds: 30
+  gateway_stop_wait_seconds: 30
 
 telegram:
   enabled: false

@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 hermes-coordinator = "hermes.coordinator:main"
 hermes-worker = "hermes.worker:main"
+hermes-gateway-worker = "hermes.gateway_worker:main"
 hermes-telegram = "hermes.telegram_bot:main"
 
 [tool.setuptools]

@@ -4,14 +4,15 @@
 
 ### 目标
 
-本项目提供一个轻量、可部署、可验证的控制平面，让一个 Telegram Director 统一管理多台机器上的 Hermes Agent：
+本项目提供一个轻量、可部署、可验证的控制平面，让一个 Telegram Director 统一管理多台机器上的开发 Agent，并把规划与执行明确分为两个阶段：
 
 1. 用户只与一个 Director Bot 交互，能够创建、查询、取消任务并查看 Worker。
 2. Coordinator 可靠保存任务，基于 Worker 注册、心跳和并发容量完成调度。
-3. Worker 在各自机器上调用本机 `hermes chat -q`，不绕过 Hermes 自身审批。
-4. 任务不会被两个 Worker 同时领取；Worker 掉线后任务可以重试或超时终止。
-5. Telegram 完全可选，核心系统在无 Token、无真实 Hermes 和无外部网络时可测试。
-6. 初期用 SQLite 降低部署成本，同时让 API 层不直接依赖 SQL，便于替换 PostgreSQL/Redis。
+3. Coordinator 在本机调用 Claude Code 或 Codex 生成并持久化执行计划。
+4. Worker 根据能力领取已完成规划的任务，调用本机配置的 Claude Code、Codex 或兼容命令。
+5. 任务不会被两个 Worker 同时领取；Worker 掉线后任务可以重试或超时终止。
+6. Telegram 完全可选，核心系统在无 Token、无真实 Agent 和无外部网络时可测试。
+7. 初期用 SQLite 降低部署成本，同时让 API 层不直接依赖 SQL，便于替换 PostgreSQL/Redis。
 
 ### 非目标
 
@@ -36,11 +37,12 @@ Telegram 平台默认不会把一个 Bot 发出的消息作为 update 投递给�
    ▼
 Director Bot ── Bearer API ──► Coordinator / FastAPI ──► SQLite
    ▲                                  │                   │
-   │ Telegram 结果推送                │ HMAC API          │ 原子状态更新
+   │ Telegram 结果推送                ├── 本机 Claude/Codex Planner
+   │                                  │ HMAC API          │ 原子状态更新
    │                                  ▼                   │
    └── notification outbox ◄──── Worker A / B / C ◄──────┘
                                       │
-                                      └── hermes chat -q <prompt>
+                                      └── 默认或指定 Agent <execution_prompt>
 ```
 
 Coordinator 是唯一控制平面。Worker 主动向 Coordinator 发起出站连接，因此通常无需向每台机器开放入站端口。Telegram Bot 同样主动长轮询 Telegram Bot API。
@@ -53,6 +55,7 @@ Coordinator 是唯一控制平面。Worker 主动向 Coordinator 发起出站连
 - 校验 Director Bearer Token 与 Worker HMAC 签名。
 - 保存 Worker 注册、最后心跳和能力元数据。
 - 创建、查询、取消任务；实施任务状态机。
+- 在 Worker 可领取前调用本机 Planner，保存 `plan` 和 `execution_prompt`。
 - 用 SQLite `BEGIN IMMEDIATE` 串行化领取事务，防止重复领取。
 - 维护 lease、执行超时、重试次数和失效任务。
 - 在任务进入终态时写入 Telegram 通知 outbox。
@@ -60,12 +63,23 @@ Coordinator 是唯一控制平面。Worker 主动向 Coordinator 发起出站连
 ### Worker
 
 - 使用稳定 `worker_id` 注册并周期心跳。
-- 根据本地并发空位主动领取任务。
+- 注册 `agent:<name>` 能力，并根据本地并发空位主动领取兼容任务。
 - 将任务标记为 `running` 后，以 `create_subprocess_exec` 启动固定命令模板。
 - 只把 `{prompt}` 作为单独参数替换，不经过 shell 解释。
 - 验证工作目录必须位于允许根目录内。
 - 本地实施超时；收到取消列表后终止或杀死子进程。
 - 捕获 stdout/stderr，限制单路最大 2 MB，并回传终态。
+
+### Gateway-aware Worker（M1）
+
+这是独立的无 GUI 进程（`python -m hermes.gateway_worker`），不是 Desktop 插件：
+
+- 启动时从 Hermes API Server（默认 `http://127.0.0.1:8642`）发现或读取 Profile 列表，并为每个 Profile 注册独立 Coordinator route；共享 `/p/<profile>/...` 监听要求启用 `gateway.multiplex_profiles`，且每个命名 Profile 必须在自己的 `.env` 配置独立 `API_SERVER_KEY`。
+- 每次执行都使用 Coordinator 返回的 `resolved_gateway_id/resolved_profile`，不会按当前 Desktop 前台连接或 profile-only 名称猜测路由。
+- 每个 Profile 可使用独立 API key（`HERMES_GATEWAY_PROFILE_KEYS_JSON`）；凭据只在 Worker 主机注入。
+- 通过 Hermes Runs API 创建、轮询、停止和基本恢复；Coordinator 的 lease/attempt 仍是唯一重试依据。
+
+M0/M1 不包含 Desktop Fleet Plugin、Desktop Proxy Executor 或跨 Gateway delegation；这些属于后续 M2/M4。Desktop 可关闭，生产任务仍应由后台 Worker 完成。
 
 ### Telegram Director
 
@@ -106,17 +120,18 @@ Director + Coordinator（中心节点）
 
 Compose 默认只启动 Coordinator。`worker` 和 `telegram` 通过 profile 选择启用。真实 Worker 常在宿主机运行，以访问本机 Hermes 与工程目录；容器 Worker 示例默认运行 mock。
 
+M1 的 `gateway-worker` Compose profile 通过 `host.docker.internal:8642` 访问宿主机 Hermes API Server，仅适合开发或受控 Docker 网络。生产部署优先在 Gateway 宿主机直接运行，以保留 OS keychain、SSH agent 和本地凭据边界；Desktop 不在 readiness chain 中。
+
 ## 6. 任务生命周期
 
-1. 用户向 Telegram 发送 `/new <prompt>` 或普通文本；也可直接调用 API。
-2. Director 使用 Bearer Token 创建 `pending` 任务，Telegram 来源同时记录 `chat_id`。
-3. 有空闲容量的 Worker 发起 claim。
-4. Coordinator 在原子事务中选择优先级最高、创建最早且目标匹配的任务，写入 `claimed_by`、lease 和 attempt。
-5. Worker 回报 `running`，启动本机 Hermes 子进程。
-6. 心跳持续续租；Coordinator 同时返回待取消任务 ID。
-7. Worker 回传 `succeeded`、`failed`、`cancelled` 或 `timed_out`。
-8. Coordinator 持久化结果；若进入终态且任务来自 Telegram，则写入 outbox。
-9. Director 发送结果到原 chat，成功后 ACK outbox 记录。
+1. 用户向 Telegram 发送 `/new` 或普通文本；也可直接调用 API。
+2. Director 创建 `planning_pending` 任务，原始 `prompt` 后续保持不变。
+3. Coordinator 领取本地规划租约，调用所选 Claude/Codex Planner。
+4. 成功后持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`。
+5. 有空闲容量且兼容 `execution_agent` 的 Worker 发起 claim；若该字段为空则 Worker 使用自身默认 Agent。
+6. Worker 回报 `running`，启动本机 Agent 子进程。
+7. 心跳持续续租；Coordinator 同时返回待取消任务 ID。
+8. Worker 回传终态，Coordinator 持久化结果并写入可选通知 outbox。
 
 ## 7. Agent 注册与心跳
 
@@ -127,8 +142,8 @@ Worker 注册字段：
 | `worker_id` | 稳定且唯一的机器/实例标识 |
 | `name` | 人类可读名称 |
 | `max_concurrency` | Coordinator 允许该 Worker 同时持有的任务数 |
-| `capabilities` | 当前为 `hermes-chat`，为后续能力路由预留 |
-| `metadata` | 平台和 Python 版本等非敏感信息 |
+| `capabilities` | `agent:<name>` 列表，用于显式执行 Agent 的兼容领取 |
+| `metadata` | 平台、Python 版本和 `default_agent` 等非敏感信息 |
 
 重复注册采用 upsert，可用于进程重启。`registered_at` 保留首次时间，`last_heartbeat_at` 更新。
 
@@ -148,7 +163,11 @@ Worker 注册字段：
 | 字段 | 说明 |
 | --- | --- |
 | `id` | UUID |
-| `prompt` | 交给 Hermes 的完整任务文本 |
+| `prompt` | 用户原始任务文本，创建后不修改 |
+| `planner_agent` | Coordinator 本地用于生成计划的 Claude 或 Codex |
+| `execution_agent` | 可选；为空时由 Worker 使用默认 Agent |
+| `plan` | Planner 输出的执行计划 |
+| `execution_prompt` | 原始任务与计划组合后的 Worker 输入 |
 | `target_worker_id` | 可选；为空表示任意 Worker |
 | `workdir` | 可选；相对 Worker 允许根目录的路径 |
 | `timeout_seconds` | 单次任务执行上限 |
@@ -180,6 +199,11 @@ Coordinator 校验签名和最大时钟偏差，并把 `(worker_id, nonce)` 原�
 ## 9. 状态机
 
 ```text
+planning_pending ──local claim──► planning ──plan ready──► pending
+       │                              │
+       └──cancel──► cancelled         ├──failure──► failed
+                                      └──timeout──► timed_out
+
 pending ──claim──► claimed ──start──► running ──success──► succeeded
    │                 │                  │  └──error──────► failed
    │                 │                  │  └──timeout────► timed_out
@@ -191,6 +215,7 @@ pending ──claim──► claimed ──start──► running ──success�
 claimed/running ──lease expiry + attempts remain──► pending
 claimed/running ──lease expiry + attempts exhausted──► timed_out
 failed(retryable) ──attempts remain──► pending
+planning ──lease expiry + attempts remain──► planning_pending
 ```
 
 终态为 `succeeded`、`failed`、`cancelled`、`timed_out`。终态结果回传是幂等的：同一 owner 重复上报只返回已有记录，不再次产生 outbox。
@@ -199,6 +224,8 @@ failed(retryable) ──attempts remain──► pending
 
 ### 重试
 
+- Planner 领取时独立增加 `planner_attempt_count`；普通非零退出、空计划和超时在规划预算未耗尽时回到 `planning_pending`。
+- Planner 配置错误（未知 Agent、缺少命令、命令不存在或无权限）直接失败，避免无意义重试。
 - claim 成功时 `attempt_count + 1`。
 - Worker 报告 `failed + retryable=true` 且次数未耗尽时，任务回到 `pending`。
 - lease 过期且次数未耗尽时也回到 `pending`。
@@ -213,7 +240,7 @@ failed(retryable) ──attempts remain──► pending
 
 ### 取消
 
-- `pending` 任务立即变为 `cancelled`。
+- `planning_pending`、`planning` 或 `pending` 任务立即变为 `cancelled`；活动 Planner 子进程会被终止。
 - `claimed/running` 任务变为 `cancel_requested`。
 - Worker 在下次心跳收到任务 ID，终止子进程并回报 `cancelled`。
 - Worker 丢失时，`cancel_requested` 在 lease 过期后由维护逻辑收敛到 `cancelled`。
@@ -229,7 +256,7 @@ Telegram 进程轮询未 ACK 通知，发送成功后再 ACK。因此交付语�
 | 输入 | 行为 |
 | --- | --- |
 | `/agents` | 列出 Worker ID、在线状态和并发 |
-| `/new <任务>` | 创建任务并返回 UUID |
+| `/new [--planner claude|codex] [--agent <agent>] <任务>` | 创建任务并可指定两阶段 Agent |
 | `/status <UUID>` | 查询状态和当前结果/错误 |
 | `/cancel <UUID>` | 请求取消 |
 | `/help` | 显示命令帮助 |
@@ -383,6 +410,14 @@ Worker API 使用前述 HMAC Header。请求/响应模型和约束可在 `/docs`
 3. 设置 Telegram Token/allowlist 后启用 `--profile telegram`。
 4. 将 Coordinator 放到 TLS/VPN 后，并持久化 `hermes-data` volume。
 
+### Gateway Worker 安装与远程安全
+
+Gateway 所在机器安装项目和依赖后，配置 `HERMES_COORDINATOR_URL`、唯一的 `HERMES_GATEWAY_WORKER_ID`、`HERMES_GATEWAY_ID`、`HERMES_GATEWAY_URL`、`HERMES_GATEWAY_PROFILES` 与 profile keys，再运行 `python -m hermes.gateway_worker`。Hermes API Server 默认端口为 `8642`；跨主机时使用 Tailscale/WireGuard 私网地址或 HTTPS/SSH 转发，禁止将 8642 直接暴露到公网。Coordinator 只接收 Worker HMAC 和 route 元数据，不接触 Gateway key。
+
+建议分别用 systemd（Linux）或 launchd（macOS）托管 Coordinator、普通 Worker、Gateway Worker 和 Telegram。服务应使用独立低权限用户、独立工作目录和受限环境文件；key 不应写入 unit/plist、镜像或日志。
+
+SQLite 升级只执行 additive migration。升级前停止 Coordinator 或使用 `sqlite3 <db> ".backup '<copy>'"` 在线备份；恢复时先停止服务，不能只复制正在使用的主 `.db` 而忽略 WAL 文件。Compose 的 `hermes-data` volume 也应在升级前导出并定期验证恢复。
+
 ## 19. 测试方案
 
 测试使用标准库 `unittest`、FastAPI ASGI transport 和 mock 子进程，不依赖外网：
@@ -395,6 +430,8 @@ Worker API 使用前述 HMAC Header。请求/响应模型和约束可在 `/docs`
 - Worker：工作目录逃逸、危险参数拒绝、mock 命令执行和结果回传。
 - Telegram：无 Token、无网络的命令与 allowlist mock。
 - 端到端：随机端口启动真实 Uvicorn，HTTP 创建任务，独立 Worker 进程执行 mock，再 HTTP 校验结果。
+- M0 路由：旧数据库迁移、route 注册/心跳、精确 Gateway/Profile claim、无 fallback、resolved route 审计、并发 claim。
+- M1 Gateway：fake Hermes API Server 的多 Profile discover/run/stop/reconcile、独立 profile key、无 Desktop GUI 的完整闭环。
 
 执行：
 

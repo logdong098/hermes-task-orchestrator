@@ -41,7 +41,7 @@ class CoordinatorAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             headers={"Authorization": "Bearer director-test-key"},
         )
         self.assertEqual(201, response.status_code)
-        self.assertEqual("pending", response.json()["status"])
+        self.assertEqual("planning_pending", response.json()["status"])
 
     async def test_worker_hmac_authentication(self) -> None:
         path = "/api/v1/workers/register"

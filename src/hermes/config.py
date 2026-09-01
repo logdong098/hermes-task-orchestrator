@@ -47,6 +47,42 @@ def _json_dict(name: str) -> Dict[str, str]:
     return parsed
 
 
+def _json_agent_commands(name: str) -> Dict[str, List[str]]:
+    """Read agent command templates from a JSON object.
+
+    Values may be argv arrays (recommended) or shell-style strings for
+    convenience.  Commands are still executed with create_subprocess_exec;
+    strings are only tokenized here and never passed through a shell.
+    """
+    value = os.getenv(name, "").strip()
+    if not value:
+        return {}
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object of agent commands")
+    commands: Dict[str, List[str]] = {}
+    for agent, command in parsed.items():
+        if not isinstance(agent, str):
+            raise ValueError(f"{name} agent names must be strings")
+        if isinstance(command, str):
+            argv = shlex.split(command)
+        elif isinstance(command, list) and all(
+            isinstance(item, str) for item in command
+        ):
+            argv = list(command)
+        else:
+            raise ValueError(f"{name} values must be argv arrays or strings")
+        commands[agent] = argv
+    return commands
+
+
+def _default_planner_commands() -> Dict[str, List[str]]:
+    return {
+        "claude": ["claude", "--permission-mode", "plan", "-p", "{prompt}"],
+        "codex": ["codex", "exec", "--sandbox", "read-only", "{prompt}"],
+    }
+
+
 @dataclass(frozen=True)
 class CoordinatorSettings:
     database_path: str = "data/hermes.db"
@@ -60,10 +96,22 @@ class CoordinatorSettings:
     max_task_timeout_seconds: int = 7200
     default_max_attempts: int = 2
     maintenance_interval_seconds: float = 5.0
+    default_planner_agent: str = "codex"
+    planner_commands: Dict[str, List[str]] = field(
+        default_factory=_default_planner_commands
+    )
+    planner_timeout_seconds: int = 900
+    planner_poll_interval_seconds: float = 2.0
+    planner_lease_seconds: int = 30
+    planner_max_attempts: int = 2
+    planner_max_output_bytes: int = 2_000_000
 
     @classmethod
     def from_env(cls) -> "CoordinatorSettings":
         load_env_file()
+        planner_commands = _json_agent_commands("HERMES_PLANNER_COMMANDS_JSON")
+        if not planner_commands:
+            planner_commands = _default_planner_commands()
         return cls(
             database_path=os.getenv("HERMES_DATABASE_PATH", "data/hermes.db"),
             director_api_key=os.getenv("HERMES_DIRECTOR_API_KEY", ""),
@@ -80,6 +128,15 @@ class CoordinatorSettings:
             maintenance_interval_seconds=_float(
                 "HERMES_MAINTENANCE_INTERVAL_SECONDS", 5.0
             ),
+            default_planner_agent=os.getenv("HERMES_PLANNER_DEFAULT_AGENT", "codex"),
+            planner_commands=planner_commands,
+            planner_timeout_seconds=_int("HERMES_PLANNER_TIMEOUT_SECONDS", 900),
+            planner_poll_interval_seconds=_float(
+                "HERMES_PLANNER_POLL_INTERVAL_SECONDS", 2.0
+            ),
+            planner_lease_seconds=_int("HERMES_PLANNER_LEASE_SECONDS", 30),
+            planner_max_attempts=_int("HERMES_PLANNER_MAX_ATTEMPTS", 2),
+            planner_max_output_bytes=_int("HERMES_PLANNER_MAX_OUTPUT_BYTES", 2_000_000),
         )
 
     def worker_secret_for(self, worker_id: str) -> str:
@@ -97,6 +154,8 @@ class WorkerSettings:
     command: List[str] = field(
         default_factory=lambda: ["hermes", "chat", "-q", "{prompt}"]
     )
+    default_agent: str = "default"
+    agent_commands: Dict[str, List[str]] = field(default_factory=dict)
     allowed_workdir: str = "."
     concurrency: int = 1
     task_timeout_seconds: int = 900
@@ -113,6 +172,7 @@ class WorkerSettings:
         command = shlex.split(
             os.getenv("HERMES_WORKER_COMMAND", "hermes chat -q {prompt}")
         )
+        agent_commands = _json_agent_commands("HERMES_WORKER_AGENTS_JSON")
         return cls(
             coordinator_url=os.getenv(
                 "HERMES_COORDINATOR_URL", "http://127.0.0.1:8000"
@@ -121,6 +181,8 @@ class WorkerSettings:
             worker_name=os.getenv("HERMES_WORKER_NAME", hostname),
             shared_secret=os.getenv("HERMES_WORKER_SHARED_SECRET", ""),
             command=command,
+            default_agent=os.getenv("HERMES_WORKER_DEFAULT_AGENT", "default"),
+            agent_commands=agent_commands,
             allowed_workdir=os.getenv("HERMES_WORKER_ALLOWED_WORKDIR", "."),
             concurrency=_int("HERMES_WORKER_CONCURRENCY", 1),
             task_timeout_seconds=_int("HERMES_WORKER_TASK_TIMEOUT_SECONDS", 900),
@@ -128,6 +190,82 @@ class WorkerSettings:
                 "HERMES_WORKER_HEARTBEAT_INTERVAL_SECONDS", 10
             ),
             poll_interval_seconds=_int("HERMES_WORKER_POLL_INTERVAL_SECONDS", 2),
+        )
+
+
+@dataclass(frozen=True)
+class GatewayWorkerSettings:
+    """Configuration for a headless worker backed by one Hermes Gateway."""
+
+    coordinator_url: str = "http://127.0.0.1:8000"
+    worker_id: str = ""
+    worker_name: str = ""
+    shared_secret: str = ""
+    gateway_url: str = "http://127.0.0.1:8642"
+    gateway_id: str = ""
+    gateway_kind: str = "local"
+    gateway_token: str = ""
+    profile_keys: Dict[str, str] = field(default_factory=dict)
+    profiles: List[str] = field(default_factory=list)
+    default_profile: str = "default"
+    default_agent: str = "hermes"
+    concurrency: int = 1
+    task_timeout_seconds: int = 900
+    heartbeat_interval_seconds: int = 10
+    poll_interval_seconds: float = 2.0
+    gateway_poll_interval_seconds: float = 2.0
+    gateway_request_timeout_seconds: float = 30.0
+    gateway_stop_wait_seconds: float = 30.0
+
+    @classmethod
+    def from_env(cls) -> "GatewayWorkerSettings":
+        import socket
+
+        load_env_file()
+        hostname = socket.gethostname()
+        profiles = [
+            p.strip()
+            for p in os.getenv("HERMES_GATEWAY_PROFILES", "").split(",")
+            if p.strip()
+        ]
+        return cls(
+            coordinator_url=os.getenv(
+                "HERMES_COORDINATOR_URL", "http://127.0.0.1:8000"
+            ).rstrip("/"),
+            worker_id=os.getenv(
+                "HERMES_GATEWAY_WORKER_ID", os.getenv("HERMES_WORKER_ID", hostname)
+            ),
+            worker_name=os.getenv(
+                "HERMES_GATEWAY_WORKER_NAME", os.getenv("HERMES_WORKER_NAME", hostname)
+            ),
+            shared_secret=os.getenv("HERMES_WORKER_SHARED_SECRET", ""),
+            gateway_url=os.getenv("HERMES_GATEWAY_URL", "http://127.0.0.1:8642").rstrip(
+                "/"
+            ),
+            gateway_id=os.getenv("HERMES_GATEWAY_ID", hostname),
+            gateway_kind=os.getenv("HERMES_GATEWAY_KIND", "local").strip().lower(),
+            gateway_token=os.getenv("HERMES_GATEWAY_TOKEN", ""),
+            profile_keys=_json_dict("HERMES_GATEWAY_PROFILE_KEYS_JSON"),
+            profiles=profiles,
+            default_profile=os.getenv(
+                "HERMES_GATEWAY_DEFAULT_PROFILE", "default"
+            ).strip(),
+            default_agent=os.getenv("HERMES_GATEWAY_DEFAULT_AGENT", "hermes"),
+            concurrency=_int("HERMES_GATEWAY_WORKER_CONCURRENCY", 1),
+            task_timeout_seconds=_int("HERMES_GATEWAY_TASK_TIMEOUT_SECONDS", 900),
+            heartbeat_interval_seconds=_int(
+                "HERMES_GATEWAY_HEARTBEAT_INTERVAL_SECONDS", 10
+            ),
+            poll_interval_seconds=_float(
+                "HERMES_GATEWAY_WORKER_POLL_INTERVAL_SECONDS", 2.0
+            ),
+            gateway_poll_interval_seconds=_float(
+                "HERMES_GATEWAY_POLL_INTERVAL_SECONDS", 2.0
+            ),
+            gateway_request_timeout_seconds=_float(
+                "HERMES_GATEWAY_REQUEST_TIMEOUT_SECONDS", 30.0
+            ),
+            gateway_stop_wait_seconds=_float("HERMES_GATEWAY_STOP_WAIT_SECONDS", 30.0),
         )
 
 

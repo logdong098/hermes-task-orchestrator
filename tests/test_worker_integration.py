@@ -38,6 +38,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             worker_id="mock-worker",
             worker_name="Mock Worker",
             shared_secret="worker-test-secret",
+            default_agent="codex",
             command=[
                 sys.executable,
                 "-c",
@@ -57,13 +58,13 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_executes_and_reports_result(self) -> None:
         await self.api.register("Mock Worker", 1)
-        create_response = await self.client.post(
-            "/api/v1/tasks",
-            json={"prompt": "integration hello", "timeout_seconds": 10},
-            headers={"Authorization": "Bearer director-test-key"},
+        created = self.store.create_task(
+            {"prompt": "integration hello", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
         )
-        self.assertEqual(201, create_response.status_code)
-        task_id = create_response.json()["id"]
+        task_id = created["id"]
         task = await self.api.claim()
         self.assertEqual(task_id, task["id"])
         runtime = WorkerRuntime(self.worker_settings, self.api)
@@ -71,6 +72,16 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = self.store.get_task(task_id)
         self.assertEqual("succeeded", result["status"])
         self.assertEqual("mock-hermes: integration hello\n", result["result"])
+
+    async def test_runtime_registers_structured_command_worker(self) -> None:
+        runtime = WorkerRuntime(self.worker_settings, self.api)
+
+        await runtime.run(once=True)
+
+        worker = self.store.list_workers(stale_seconds=45)[0]
+        self.assertEqual("command", worker["worker_kind"])
+        self.assertEqual("codex", worker["default_agent"])
+        self.assertEqual("codex", worker["routes"][0]["default_agent"])
 
     async def test_workdir_escape_and_bypass_are_rejected(self) -> None:
         runtime = WorkerRuntime(self.worker_settings, self.api)
@@ -93,6 +104,58 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         output = await WorkerRuntime._read_limited(reader)
         self.assertLess(len(output), 2_100_000)
         self.assertIn(b"output truncated", output)
+
+    async def test_agent_command_and_execution_prompt_are_selected(self) -> None:
+        settings = WorkerSettings(
+            worker_id="agent-worker",
+            worker_name="Agent Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            agent_commands={
+                "codex": [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('codex: ' + sys.argv[1])",
+                    "{prompt}",
+                ],
+                "claude": [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('claude: ' + sys.argv[1])",
+                    "{prompt}",
+                ],
+            },
+            allowed_workdir=self.temporary_directory.name,
+        )
+        runtime = WorkerRuntime(settings, self.api)
+        self.assertEqual(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('claude: ' + sys.argv[1])",
+                "plan",
+            ],
+            runtime.command_for("plan", "claude"),
+        )
+        self.assertEqual(["agent:claude", "agent:codex"], runtime.capabilities())
+        with self.assertRaises(ValueError):
+            runtime.command_for("x", "unknown")
+
+        await self.api.register("Mock Worker", 1)
+        created = self.store.create_task(
+            {"prompt": "original", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        task_id = created["id"]
+        task = await self.api.claim()
+        task["execution_agent"] = "claude"
+        task["execution_prompt"] = "specialized"
+        await runtime.run_task(task)
+        result = self.store.get_task(task_id)
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual("claude: specialized\n", result["result"])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +14,7 @@ from .config import TelegramSettings
 LOGGER = logging.getLogger("hermes.telegram")
 HELP_TEXT = """Hermes Director 命令：
 /agents - 查看 Worker 在线状态
-/new <任务> - 创建任务
+/new [--planner claude|codex] [--worker <id>] [--gateway <id> --profile <name>] [--executor <agent>] <任务> - 创建任务
 /status <任务ID> - 查询任务
 /cancel <任务ID> - 取消任务
 /help - 显示帮助
@@ -63,6 +64,11 @@ class DirectorAPI:
         user_id: int,
         chat_id: int,
         idempotency_key: Optional[str] = None,
+        planner_agent: Optional[str] = None,
+        execution_agent: Optional[str] = None,
+        target_worker_id: Optional[str] = None,
+        target_gateway_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self._request(
             "POST",
@@ -72,6 +78,11 @@ class DirectorAPI:
                 "creator_user_id": str(user_id),
                 "telegram_chat_id": str(chat_id),
                 "idempotency_key": idempotency_key,
+                "planner_agent": planner_agent,
+                "execution_agent": execution_agent,
+                "target_worker_id": target_worker_id,
+                "target_gateway_id": target_gateway_id,
+                "target_profile": target_profile,
             },
         )
 
@@ -185,9 +196,10 @@ class DirectorBot:
         chat_id: int,
         idempotency_key: Optional[str] = None,
     ) -> str:
-        command, separator, argument = text.partition(" ")
+        parts = text.split(maxsplit=1)
+        command = parts[0]
+        argument = parts[1].strip() if len(parts) == 2 else ""
         command = command.split("@", 1)[0].lower()
-        argument = argument.strip() if separator else ""
         if command == "/help" or command == "/start":
             return HELP_TEXT
         if command == "/agents":
@@ -203,17 +215,67 @@ class DirectorBot:
             return "\n".join(lines)
         if command == "/new":
             if not argument:
-                return "用法：/new <任务描述>"
+                return (
+                    "用法：/new [--planner claude|codex] [--worker <id>] "
+                    "[--gateway <id> --profile <name>] [--executor <agent>] <任务描述>"
+                )
+            parsed = self._parse_new_arguments(argument)
+            if parsed is None:
+                return (
+                    "参数错误。Gateway 与 Profile 必须同时指定。\n"
+                    "用法：/new [--planner claude|codex] [--worker <id>] "
+                    "[--gateway <id> --profile <name>] [--executor <agent>] <任务描述>"
+                )
+            (
+                prompt,
+                planner_agent,
+                execution_agent,
+                target_worker_id,
+                target_gateway_id,
+                target_profile,
+            ) = parsed
             task = await self.director.create_task(
-                argument, user_id, chat_id, idempotency_key
+                prompt,
+                user_id,
+                chat_id,
+                idempotency_key,
+                planner_agent=planner_agent,
+                execution_agent=execution_agent,
+                target_worker_id=target_worker_id,
+                target_gateway_id=target_gateway_id,
+                target_profile=target_profile,
             )
-            return f"任务已创建：{task['id']}\n状态：{task['status']}"
+            detail = self._route_detail(
+                planner_agent,
+                execution_agent,
+                target_worker_id,
+                target_gateway_id,
+                target_profile,
+            )
+            suffix = f"\n{detail}" if detail else ""
+            return f"任务已创建：{task['id']}\n状态：{task['status']}{suffix}"
         if command == "/status":
             if not argument:
                 return "用法：/status <任务ID>"
             task = await self.director.get_task(argument)
-            detail = task.get("result") or task.get("error") or "暂无结果"
-            return f"任务：{task['id']}\n状态：{task['status']}\n详情：{detail}"
+            detail = (
+                task.get("result")
+                or task.get("error")
+                or task.get("routing_diagnostic")
+                or "暂无结果"
+            )
+            planning = self._route_detail(
+                task.get("planner_agent"),
+                task.get("resolved_execution_agent") or task.get("execution_agent"),
+                task.get("resolved_worker_id") or task.get("target_worker_id"),
+                task.get("resolved_gateway_id") or task.get("target_gateway_id"),
+                task.get("resolved_profile") or task.get("target_profile"),
+            )
+            planning_line = f"\n{planning}" if planning else ""
+            return (
+                f"任务：{task['id']}\n状态：{task['status']}"
+                f"{planning_line}\n详情：{detail}"
+            )
         if command == "/cancel":
             if not argument:
                 return "用法：/cancel <任务ID>"
@@ -221,8 +283,109 @@ class DirectorBot:
             return f"任务 {task['id']} 当前状态：{task['status']}"
         if command.startswith("/"):
             return "未知命令。\n\n" + HELP_TEXT
-        task = await self.director.create_task(text, user_id, chat_id, idempotency_key)
+        task = await self.director.create_task(
+            text,
+            user_id,
+            chat_id,
+            idempotency_key,
+            planner_agent=None,
+            execution_agent=None,
+            target_worker_id=None,
+            target_gateway_id=None,
+            target_profile=None,
+        )
         return f"任务已创建：{task['id']}\n状态：{task['status']}"
+
+    @staticmethod
+    def _parse_new_arguments(
+        argument: str,
+    ) -> Optional[
+        tuple[
+            str,
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ]
+    ]:
+        """Parse the optional routing flags without creating a task on errors."""
+        try:
+            tokens = shlex.split(argument)
+        except ValueError:
+            return None
+        planner_agent: Optional[str] = None
+        execution_agent: Optional[str] = None
+        target_worker_id: Optional[str] = None
+        target_gateway_id: Optional[str] = None
+        target_profile: Optional[str] = None
+        index = 0
+        while index < len(tokens) and tokens[index].startswith("--"):
+            option = tokens[index]
+            if option not in (
+                "--planner",
+                "--agent",
+                "--executor",
+                "--worker",
+                "--gateway",
+                "--profile",
+            ) or index + 1 >= len(tokens):
+                return None
+            value = tokens[index + 1]
+            if not value or value.startswith("--"):
+                return None
+            if option == "--planner":
+                if planner_agent is not None or value not in ("claude", "codex"):
+                    return None
+                planner_agent = value
+            elif option in ("--agent", "--executor"):
+                if execution_agent is not None:
+                    return None
+                execution_agent = value
+            elif option == "--worker":
+                if target_worker_id is not None:
+                    return None
+                target_worker_id = value
+            elif option == "--gateway":
+                if target_gateway_id is not None:
+                    return None
+                target_gateway_id = value
+            else:
+                if target_profile is not None:
+                    return None
+                target_profile = value
+            index += 2
+        if index >= len(tokens):
+            return None
+        if (target_gateway_id is None) != (target_profile is None):
+            return None
+        return (
+            " ".join(tokens[index:]),
+            planner_agent,
+            execution_agent,
+            target_worker_id,
+            target_gateway_id,
+            target_profile,
+        )
+
+    @staticmethod
+    def _route_detail(
+        planner_agent: Optional[str],
+        execution_agent: Optional[str],
+        worker_id: Optional[str] = None,
+        gateway_id: Optional[str] = None,
+        profile: Optional[str] = None,
+    ) -> str:
+        values = []
+        if planner_agent:
+            values.append(f"规划 Agent：{planner_agent}")
+        if execution_agent:
+            values.append(f"执行 Agent：{execution_agent}")
+        if worker_id:
+            values.append(f"Worker：{worker_id}")
+        if gateway_id and profile:
+            values.append(f"Gateway/Profile：{gateway_id}/{profile}")
+        return " | ".join(values)
 
     def load_offset(self) -> Optional[int]:
         path = Path(self.settings.offset_path)

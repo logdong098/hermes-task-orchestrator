@@ -59,7 +59,22 @@ class WorkerAPI:
             return {}
         return response.json()
 
-    async def register(self, name: str, max_concurrency: int) -> Dict[str, Any]:
+    async def register(
+        self,
+        name: str,
+        max_concurrency: int,
+        capabilities: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        worker_kind: str = "command",
+        default_agent: str = "default",
+        routes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        registration_metadata = {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        }
+        if metadata:
+            registration_metadata.update(metadata)
         return await self._request(
             "POST",
             "/api/v1/workers/register",
@@ -67,11 +82,11 @@ class WorkerAPI:
                 "worker_id": self.worker_id,
                 "name": name,
                 "max_concurrency": max_concurrency,
-                "capabilities": ["hermes-chat"],
-                "metadata": {
-                    "platform": platform.platform(),
-                    "python": platform.python_version(),
-                },
+                "capabilities": capabilities or ["hermes-chat"],
+                "metadata": registration_metadata,
+                "worker_kind": worker_kind,
+                "default_agent": default_agent,
+                "routes": routes or [],
             },
         )
 
@@ -133,13 +148,24 @@ class WorkerRuntime:
             raise ValueError("HERMES_WORKER_ID is required")
         if not self.settings.shared_secret:
             raise ValueError("HERMES_WORKER_SHARED_SECRET is required")
-        if not self.settings.command:
-            raise ValueError("worker command must not be empty")
-        lowered = [part.lower() for part in self.settings.command]
-        if any("dangerously-bypass" in part for part in lowered):
-            raise ValueError("dangerously-bypass options are forbidden")
-        if "{prompt}" not in self.settings.command:
-            raise ValueError("worker command must contain a {prompt} argument")
+        if not self.settings.default_agent:
+            raise ValueError("default agent must not be empty")
+        commands = dict(self.settings.agent_commands)
+        if not commands:
+            commands[self.settings.default_agent] = self.settings.command
+        elif self.settings.default_agent not in commands:
+            # HERMES_WORKER_COMMAND remains the fallback for the default agent.
+            commands[self.settings.default_agent] = self.settings.command
+        for agent, command in commands.items():
+            if not agent or not command:
+                raise ValueError("agent commands must have non-empty names and argv")
+            lowered = [part.lower() for part in command]
+            if any("dangerously-bypass" in part for part in lowered):
+                raise ValueError("dangerously-bypass options are forbidden")
+            if "{prompt}" not in command:
+                raise ValueError(
+                    f"command for agent {agent} must contain a {{prompt}} argument"
+                )
         if not self.allowed_workdir.is_dir():
             raise ValueError("allowed work directory does not exist")
         if self.settings.concurrency < 1:
@@ -159,11 +185,20 @@ class WorkerRuntime:
             raise ValueError("requested workdir does not exist")
         return candidate
 
-    def command_for(self, prompt: str) -> List[str]:
-        return [
-            prompt if argument == "{prompt}" else argument
-            for argument in self.settings.command
-        ]
+    def command_for(self, prompt: str, agent: Optional[str] = None) -> List[str]:
+        selected_agent = agent or self.settings.default_agent
+        command = self.settings.agent_commands.get(selected_agent)
+        if command is None:
+            if selected_agent == self.settings.default_agent:
+                command = self.settings.command
+            else:
+                raise ValueError(f"unknown execution agent: {selected_agent}")
+        return [prompt if argument == "{prompt}" else argument for argument in command]
+
+    def capabilities(self) -> List[str]:
+        agents = set(self.settings.agent_commands)
+        agents.add(self.settings.default_agent)
+        return [f"agent:{agent}" for agent in sorted(agents)]
 
     @staticmethod
     async def _read_limited(
@@ -204,7 +239,8 @@ class WorkerRuntime:
                     return
                 raise
             workdir = self.resolve_workdir(task.get("workdir"))
-            command = self.command_for(task["prompt"])
+            prompt = task.get("execution_prompt") or task["prompt"]
+            command = self.command_for(prompt, task.get("execution_agent"))
             LOGGER.info("starting task %s in %s", task_id, workdir)
             process_options: Dict[str, Any] = {}
             if os.name == "posix":
@@ -329,7 +365,14 @@ class WorkerRuntime:
         self.active.pop(task_id, None)
 
     async def run(self, once: bool = False) -> None:
-        await self.api.register(self.settings.worker_name, self.settings.concurrency)
+        await self.api.register(
+            self.settings.worker_name,
+            self.settings.concurrency,
+            capabilities=self.capabilities(),
+            metadata={"default_agent": self.settings.default_agent},
+            worker_kind="command",
+            default_agent=self.settings.default_agent,
+        )
         LOGGER.info("worker %s registered", self.settings.worker_id)
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         try:

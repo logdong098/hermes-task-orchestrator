@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -50,6 +51,17 @@ def main() -> None:
                     f"{sys.executable} -m hermes.mock_hermes -q {{prompt}}"
                 ),
                 "HERMES_WORKER_POLL_INTERVAL_SECONDS": "1",
+                "HERMES_PLANNER_POLL_INTERVAL_SECONDS": "0.1",
+                "HERMES_PLANNER_COMMANDS_JSON": json.dumps(
+                    {
+                        "codex": [
+                            sys.executable,
+                            "-c",
+                            "import sys; print('plan: ' + sys.argv[1])",
+                            "{prompt}",
+                        ]
+                    }
+                ),
             }
         )
         coordinator = subprocess.Popen(
@@ -78,6 +90,18 @@ def main() -> None:
             )
             created.raise_for_status()
             task_id = created.json()["id"]
+            for _ in range(50):
+                planned = httpx.get(
+                    f"{base_url}/api/v1/tasks/{task_id}",
+                    headers=headers,
+                    timeout=5,
+                )
+                planned.raise_for_status()
+                if planned.json()["status"] == "pending":
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"task was not planned: {planned.json()}")
             worker = subprocess.run(
                 [sys.executable, "-m", "hermes.worker", "--once"],
                 env=environment,

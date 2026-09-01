@@ -15,12 +15,15 @@ from .models import (
     HeartbeatRequest,
     NotificationResponse,
     TaskCreate,
+    TaskRemoteRunUpdate,
     TaskResponse,
     TaskResult,
     TaskStatusUpdate,
     WorkerRegistration,
     WorkerResponse,
+    WorkerRouteResponse,
 )
+from .planner import PlannerRuntime, PlannerSettings
 from .security import verify_signature
 from .storage import ConflictError, NotFoundError, SQLiteStore
 
@@ -33,6 +36,17 @@ def create_app(
 ) -> FastAPI:
     configured = settings or CoordinatorSettings.from_env()
     repository = store or SQLiteStore(configured.database_path)
+    planner = PlannerRuntime(
+        PlannerSettings(
+            agent_commands=configured.planner_commands,
+            default_agent=configured.default_planner_agent,
+            timeout_seconds=configured.planner_timeout_seconds,
+            max_output_bytes=configured.planner_max_output_bytes,
+            poll_interval_seconds=configured.planner_poll_interval_seconds,
+            lease_seconds=configured.planner_lease_seconds,
+        ),
+        repository,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -54,10 +68,15 @@ def create_app(
                     pass
 
         maintenance_task = asyncio.create_task(maintenance_loop())
+        planner_task = asyncio.create_task(planner.run(stopping))
         try:
             yield
         finally:
             stopping.set()
+            for task_id in list(planner.processes):
+                await planner.cancel_task(task_id)
+            planner_task.cancel()
+            await asyncio.gather(planner_task, return_exceptions=True)
             await maintenance_task
 
     app = FastAPI(
@@ -67,6 +86,7 @@ def create_app(
     )
     app.state.settings = configured
     app.state.store = repository
+    app.state.planner = planner
 
     async def worker_auth(
         request: Request,
@@ -129,9 +149,50 @@ def create_app(
 
     def task_or_404(task_id: str) -> Dict[str, Any]:
         try:
-            return repository.get_task(task_id)
+            return with_routing_diagnostic(repository.get_task(task_id))
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    def with_routing_diagnostic(task: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(task)
+        enriched["routing_diagnostic"] = None
+        if task.get("status") != "pending" or not task.get("target_gateway_id"):
+            return enriched
+        routes = repository.list_routes(configured.worker_stale_seconds)
+        matching = [
+            route
+            for route in routes
+            if route.get("gateway_id") == task.get("target_gateway_id")
+            and (route.get("target_profile") or route.get("profile"))
+            == task.get("target_profile")
+        ]
+        if task.get("target_worker_id"):
+            matching = [
+                route
+                for route in matching
+                if route.get("worker_id") == task.get("target_worker_id")
+            ]
+        if not matching:
+            enriched["routing_diagnostic"] = (
+                "no registered route matches the requested Gateway/Profile"
+            )
+            return enriched
+        online = [route for route in matching if route.get("status") == "online"]
+        if not online:
+            enriched["routing_diagnostic"] = "matching route is offline"
+            return enriched
+        requested_agent = task.get("execution_agent")
+        if requested_agent and not any(
+            requested_agent in route.get("supported_agents", []) for route in online
+        ):
+            enriched["routing_diagnostic"] = (
+                "matching route does not support the requested execution agent"
+            )
+            return enriched
+        enriched["routing_diagnostic"] = (
+            "matching route is online but currently has no claim capacity"
+        )
+        return enriched
 
     @app.get("/healthz")
     def health() -> Dict[str, str]:
@@ -159,6 +220,14 @@ def create_app(
                 worker_id,
                 heartbeat_request.running_task_ids,
                 configured.task_lease_seconds,
+                routes=(
+                    [
+                        route.model_dump(mode="json")
+                        for route in heartbeat_request.routes
+                    ]
+                    if heartbeat_request.routes is not None
+                    else None
+                ),
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -172,6 +241,14 @@ def create_app(
     def list_workers() -> List[Dict[str, Any]]:
         return repository.list_workers(configured.worker_stale_seconds)
 
+    @app.get(
+        "/api/v1/routes",
+        response_model=List[WorkerRouteResponse],
+        dependencies=[Depends(director_auth)],
+    )
+    def list_routes() -> List[Dict[str, Any]]:
+        return repository.list_routes(configured.worker_stale_seconds)
+
     @app.post(
         "/api/v1/tasks",
         response_model=TaskResponse,
@@ -179,11 +256,16 @@ def create_app(
         dependencies=[Depends(director_auth)],
     )
     def create_task(task: TaskCreate) -> Dict[str, Any]:
+        payload = task.model_dump(mode="json")
+        payload["planner_agent"] = (
+            payload.get("planner_agent") or configured.default_planner_agent
+        )
         return repository.create_task(
-            task.model_dump(),
+            payload,
             configured.default_task_timeout_seconds,
             configured.max_task_timeout_seconds,
             configured.default_max_attempts,
+            configured.planner_max_attempts,
         )
 
     @app.get(
@@ -192,7 +274,10 @@ def create_app(
         dependencies=[Depends(director_auth)],
     )
     def list_tasks(limit: int = 100) -> List[Dict[str, Any]]:
-        return repository.list_tasks(max(1, min(limit, 500)))
+        return [
+            with_routing_diagnostic(task)
+            for task in repository.list_tasks(max(1, min(limit, 500)))
+        ]
 
     @app.get(
         "/api/v1/tasks/{task_id}",
@@ -207,9 +292,11 @@ def create_app(
         response_model=TaskResponse,
         dependencies=[Depends(director_auth)],
     )
-    def cancel_task(task_id: str) -> Dict[str, Any]:
+    async def cancel_task(task_id: str) -> Dict[str, Any]:
         try:
-            return repository.cancel_task(task_id)
+            task = repository.cancel_task(task_id)
+            await planner.cancel_task(task_id)
+            return task
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -235,6 +322,24 @@ def create_app(
         try:
             return repository.update_task_status(
                 task_id, authenticated_worker_id, update.status.value
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tasks/{task_id}/remote-run", response_model=TaskResponse)
+    def attach_remote_run(
+        task_id: str,
+        update: TaskRemoteRunUpdate,
+        authenticated_worker_id: str = Depends(worker_auth),
+    ) -> Dict[str, Any]:
+        try:
+            return repository.attach_remote_run(
+                task_id,
+                authenticated_worker_id,
+                update.remote_run_id,
+                update.remote_session_id,
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

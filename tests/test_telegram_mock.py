@@ -23,8 +23,30 @@ class FakeDirector:
             }
         ]
 
-    async def create_task(self, prompt, user_id, chat_id, idempotency_key=None):
-        self.created.append((prompt, user_id, chat_id))
+    async def create_task(
+        self,
+        prompt,
+        user_id,
+        chat_id,
+        idempotency_key=None,
+        planner_agent=None,
+        execution_agent=None,
+        target_worker_id=None,
+        target_gateway_id=None,
+        target_profile=None,
+    ):
+        self.created.append(
+            (
+                prompt,
+                user_id,
+                chat_id,
+                planner_agent,
+                execution_agent,
+                target_worker_id,
+                target_gateway_id,
+                target_profile,
+            )
+        )
         return {"id": "task-1", "status": "pending"}
 
     async def get_task(self, task_id):
@@ -61,6 +83,52 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         plain = await self.bot.handle_text("plain task", 42, 100)
         self.assertIn("task-1", plain)
         self.assertEqual("plain task", self.director.created[-1][0])
+        self.assertIsNone(self.director.created[-1][3])
+        self.assertIsNone(self.director.created[-1][4])
+
+    async def test_new_routes_planner_and_execution_agent(self) -> None:
+        created = await self.bot.handle_text(
+            "/new --planner codex --worker worker-a --gateway homelab "
+            "--profile architect --executor codex implement feature",
+            42,
+            100,
+        )
+        self.assertIn("规划 Agent：codex", created)
+        self.assertIn("执行 Agent：codex", created)
+        self.assertIn("Worker：worker-a", created)
+        self.assertIn("Gateway/Profile：homelab/architect", created)
+        self.assertEqual("implement feature", self.director.created[-1][0])
+        self.assertEqual("codex", self.director.created[-1][3])
+        self.assertEqual("codex", self.director.created[-1][4])
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("homelab", self.director.created[-1][6])
+        self.assertEqual("architect", self.director.created[-1][7])
+
+    async def test_new_keeps_agent_as_executor_alias(self) -> None:
+        created = await self.bot.handle_text(
+            "/new --agent claude implement feature", 42, 100
+        )
+        self.assertIn("执行 Agent：claude", created)
+        self.assertEqual("claude", self.director.created[-1][4])
+
+    async def test_gateway_and_profile_must_be_paired(self) -> None:
+        before = len(self.director.created)
+        response = await self.bot.handle_text(
+            "/new --gateway homelab implement feature", 42, 100
+        )
+        self.assertIn("Gateway 与 Profile 必须同时指定", response)
+        self.assertEqual(before, len(self.director.created))
+
+    async def test_invalid_new_options_do_not_create_task(self) -> None:
+        before = len(self.director.created)
+        response = await self.bot.handle_text("/new --planner invalid task", 42, 100)
+        self.assertIn("参数错误", response)
+        self.assertEqual(before, len(self.director.created))
+
+    async def test_new_accepts_tab_separator(self) -> None:
+        response = await self.bot.handle_text("/new\timplement tab parsing", 42, 100)
+        self.assertIn("task-1", response)
+        self.assertEqual("implement tab parsing", self.director.created[-1][0])
 
     async def test_allowlist_rejects_unknown_user(self) -> None:
         await self.bot.handle_update(
