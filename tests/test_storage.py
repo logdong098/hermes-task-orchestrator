@@ -396,10 +396,20 @@ class SQLiteStoreTests(unittest.TestCase):
                 ("legacy-run", 3, task["id"]),
             )
 
+        connection.close()
+
         self.store.initialize()
 
         migrated = self.store.get_task(task["id"])
         self.assertEqual(3, migrated["remote_run_attempt"])
+
+    def test_store_connection_closes_after_transaction_context(self) -> None:
+        connection = self.store._connect()
+        with connection:
+            connection.execute("SELECT 1")
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_worker_cannot_claim_deadline_exceeded_early(self) -> None:
         task = self.create_task(planning_mode="direct", timeout_seconds=60)
@@ -582,6 +592,8 @@ class SQLiteStoreTests(unittest.TestCase):
                 """
             )
 
+        connection.close()
+
         store = SQLiteStore(database)
         store.initialize()
         migrated = store.get_task("legacy-task")
@@ -680,6 +692,8 @@ class SQLiteStoreTests(unittest.TestCase):
                 )
                 """
             )
+
+        connection.close()
 
         store = SQLiteStore(database)
         store.initialize()

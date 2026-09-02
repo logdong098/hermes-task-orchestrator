@@ -23,6 +23,26 @@ class NotFoundError(RuntimeError):
     pass
 
 
+class _ClosingConnection:
+    """Add deterministic close semantics to sqlite3's transaction context."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> "_ClosingConnection":
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> Any:
+        try:
+            return self._connection.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._connection.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 class SQLiteStore:
     """SQLite-backed repository; API code only depends on these repository methods."""
 
@@ -282,17 +302,21 @@ class SQLiteStore:
                     ),
                 )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> _ClosingConnection:
         connection = sqlite3.connect(
             self.database_path,
             timeout=10,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            return _ClosingConnection(connection)
+        except Exception:
+            connection.close()
+            raise
 
     @staticmethod
     def _json(value: Any) -> str:

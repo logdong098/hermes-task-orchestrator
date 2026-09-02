@@ -108,6 +108,73 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(output), 2_100_000)
         self.assertIn(b"output truncated", output)
 
+    async def test_local_agent_normalizes_crlf_on_success(self) -> None:
+        settings = WorkerSettings(
+            worker_id="crlf-success-worker",
+            worker_name="CRLF Success Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "codex": [
+                    sys.executable,
+                    "-c",
+                    r"import sys; sys.stdout.buffer.write(b'line1\r\nline2\r\n')",
+                    "{prompt}",
+                ]
+            },
+            allowed_workdir=self.temporary_directory.name,
+        )
+        await self.api.register("CRLF Success Worker", 1)
+        created = self.store.create_task(
+            {"prompt": "success", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        task = await self.api.claim()
+        self.assertEqual(created["id"], task["id"])
+
+        await WorkerRuntime(settings, self.api).run_task(task)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual("line1\nline2\n", result["result"])
+
+    async def test_local_agent_normalizes_crlf_on_failure_output(self) -> None:
+        settings = WorkerSettings(
+            worker_id="crlf-failure-worker",
+            worker_name="CRLF Failure Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "codex": [
+                    sys.executable,
+                    "-c",
+                    r"import sys; sys.stdout.buffer.write(b'partial\r\n'); sys.stderr.buffer.write(b'failed\r\nreason\r\n'); raise SystemExit(3)",
+                    "{prompt}",
+                ]
+            },
+            allowed_workdir=self.temporary_directory.name,
+        )
+        await self.api.register("CRLF Failure Worker", 1)
+        created = self.store.create_task(
+            {"prompt": "failure", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        task = await self.api.claim()
+        self.assertEqual(created["id"], task["id"])
+
+        await WorkerRuntime(settings, self.api).run_task(task)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("partial\n", result["result"])
+        self.assertEqual("failed\nreason\n", result["error"])
+
     async def test_agent_command_and_execution_prompt_are_selected(self) -> None:
         settings = WorkerSettings(
             worker_id="agent-worker",

@@ -32,6 +32,10 @@ def build_execution_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]
     return environment
 
 
+def normalize_process_output(value: str) -> str:
+    return value.replace("\r\n", "\n")
+
+
 class WorkerAPI:
     def __init__(
         self,
@@ -373,8 +377,10 @@ class WorkerRuntime:
                     error=f"local execution exceeded {timeout} seconds",
                 )
                 return
-            output = stdout.decode("utf-8", errors="replace")
-            error_output = stderr.decode("utf-8", errors="replace")
+            output = normalize_process_output(stdout.decode("utf-8", errors="replace"))
+            error_output = normalize_process_output(
+                stderr.decode("utf-8", errors="replace")
+            )
             if task_id in self.cancelled:
                 await self.api.report(
                     task_id,

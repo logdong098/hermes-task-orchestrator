@@ -663,6 +663,8 @@ class StorageRouteTests(unittest.TestCase):
                     20,
                 ),
             )
+
+        connection.close()
         migrated = SQLiteStore(database)
         migrated.initialize()
         route = migrated.list_routes(stale_seconds=100, now=21)[0]
