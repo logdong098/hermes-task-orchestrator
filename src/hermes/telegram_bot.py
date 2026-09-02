@@ -14,12 +14,15 @@ from .config import TelegramSettings
 LOGGER = logging.getLogger("hermes.telegram")
 HELP_TEXT = """Hermes Director 命令：
 /agents - 查看 Worker 在线状态
+/tasks - 查看最近任务与进度
 /new [--planner claude|codex] [--worker <id>] [--gateway <id> --profile <name>] [--executor <agent>] <任务> - 创建任务
 /status <任务ID> - 查询任务
 /cancel <任务ID> - 取消任务
 /help - 显示帮助
 
-直接发送普通文本也会创建任务。"""
+直接发送普通文本也会创建任务。
+@worker1 <任务> - 跳过规划，直接交给指定 Worker
+@Coordinator [@worker1] <任务> - 先规划，再自动或定向执行"""
 
 
 class DirectorAPI:
@@ -58,6 +61,9 @@ class DirectorAPI:
     async def list_workers(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/api/v1/workers")
 
+    async def list_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        return await self._request("GET", f"/api/v1/tasks?limit={limit}")
+
     async def create_task(
         self,
         prompt: str,
@@ -69,6 +75,7 @@ class DirectorAPI:
         target_worker_id: Optional[str] = None,
         target_gateway_id: Optional[str] = None,
         target_profile: Optional[str] = None,
+        planning_mode: str = "auto",
     ) -> Dict[str, Any]:
         return await self._request(
             "POST",
@@ -79,6 +86,7 @@ class DirectorAPI:
                 "telegram_chat_id": str(chat_id),
                 "idempotency_key": idempotency_key,
                 "planner_agent": planner_agent,
+                "planning_mode": planning_mode,
                 "execution_agent": execution_agent,
                 "target_worker_id": target_worker_id,
                 "target_gateway_id": target_gateway_id,
@@ -213,6 +221,19 @@ class DirectorBot:
                     f"并发 {worker['max_concurrency']}"
                 )
             return "\n".join(lines)
+        if command == "/tasks":
+            tasks = await self.director.list_tasks(limit=20)
+            if not tasks:
+                return "暂无任务。"
+            lines = ["最近任务："]
+            for task in tasks:
+                worker = task.get("resolved_worker_id") or task.get("target_worker_id")
+                worker_text = f" | {worker}" if worker else ""
+                lines.append(
+                    f"- {task['id']} | {task['status']} | "
+                    f"{task.get('current_phase') or 'created'}{worker_text}"
+                )
+            return "\n".join(lines)
         if command == "/new":
             if not argument:
                 return (
@@ -244,6 +265,7 @@ class DirectorBot:
                 target_worker_id=target_worker_id,
                 target_gateway_id=target_gateway_id,
                 target_profile=target_profile,
+                planning_mode="auto",
             )
             detail = self._route_detail(
                 planner_agent,
@@ -253,29 +275,12 @@ class DirectorBot:
                 target_profile,
             )
             suffix = f"\n{detail}" if detail else ""
-            return f"任务已创建：{task['id']}\n状态：{task['status']}{suffix}"
+            return f"{self._format_created_task(task)}{suffix}"
         if command == "/status":
             if not argument:
                 return "用法：/status <任务ID>"
             task = await self.director.get_task(argument)
-            detail = (
-                task.get("result")
-                or task.get("error")
-                or task.get("routing_diagnostic")
-                or "暂无结果"
-            )
-            planning = self._route_detail(
-                task.get("planner_agent"),
-                task.get("resolved_execution_agent") or task.get("execution_agent"),
-                task.get("resolved_worker_id") or task.get("target_worker_id"),
-                task.get("resolved_gateway_id") or task.get("target_gateway_id"),
-                task.get("resolved_profile") or task.get("target_profile"),
-            )
-            planning_line = f"\n{planning}" if planning else ""
-            return (
-                f"任务：{task['id']}\n状态：{task['status']}"
-                f"{planning_line}\n详情：{detail}"
-            )
+            return self._format_task_status(task)
         if command == "/cancel":
             if not argument:
                 return "用法：/cancel <任务ID>"
@@ -283,6 +288,32 @@ class DirectorBot:
             return f"任务 {task['id']} 当前状态：{task['status']}"
         if command.startswith("/"):
             return "未知命令。\n\n" + HELP_TEXT
+        directives = self._parse_directives(text)
+        if directives is not None:
+            prompt, wants_planning, worker_mentions, error = directives
+            if error:
+                return error
+            workers = await self.director.list_workers()
+            worker_ids = {worker["worker_id"] for worker in workers}
+            target_worker_id = worker_mentions[0] if worker_mentions else None
+            if target_worker_id and target_worker_id not in worker_ids:
+                return (
+                    f"未知 Worker：{target_worker_id}。请用 /agents 查看可用 Worker。"
+                )
+            planning_mode = "plan" if wants_planning else "direct"
+            task = await self.director.create_task(
+                prompt,
+                user_id,
+                chat_id,
+                idempotency_key,
+                planner_agent=None,
+                execution_agent=None,
+                target_worker_id=target_worker_id,
+                target_gateway_id=None,
+                target_profile=None,
+                planning_mode=planning_mode,
+            )
+            return self._format_created_task(task)
         task = await self.director.create_task(
             text,
             user_id,
@@ -293,8 +324,116 @@ class DirectorBot:
             target_worker_id=None,
             target_gateway_id=None,
             target_profile=None,
+            planning_mode="auto",
         )
-        return f"任务已创建：{task['id']}\n状态：{task['status']}"
+        return self._format_created_task(task)
+
+    @staticmethod
+    def _parse_directives(
+        text: str,
+    ) -> Optional[tuple[str, bool, List[str], Optional[str]]]:
+        tokens = text.split()
+        if not tokens or not tokens[0].startswith("@"):
+            return None
+        index = 0
+        coordinator_count = 0
+        worker_mentions: List[str] = []
+        while index < len(tokens) and tokens[index].startswith("@"):
+            name = tokens[index][1:]
+            if not name:
+                return "", False, [], "@ 后必须指定 Coordinator 或 Worker ID。"
+            if name.casefold() == "coordinator":
+                coordinator_count += 1
+            else:
+                worker_mentions.append(name)
+            index += 1
+        if coordinator_count > 1:
+            return "", False, [], "@Coordinator 只能指定一次。"
+        if len(worker_mentions) > 1:
+            if len(set(worker_mentions)) == 1:
+                return "", False, [], "同一个 Worker 只能指定一次。"
+            return (
+                "",
+                False,
+                [],
+                "当前版本一次只能指定一个 Worker；多 Worker 工作流暂未启用。",
+            )
+        prompt = " ".join(tokens[index:]).strip()
+        if not prompt:
+            return "", False, [], "请在 @ 指令后填写任务描述。"
+        return prompt, coordinator_count == 1, worker_mentions[:1], None
+
+    @classmethod
+    def _format_created_task(cls, task: Dict[str, Any]) -> str:
+        mode = task.get("planning_mode", "auto")
+        mode_text = "先规划后执行" if mode == "plan" else "直接执行"
+        return (
+            f"任务已创建：{task['id']}\n模式：{mode_text}\n"
+            f"状态：{task['status']}\n阶段：{task.get('current_phase') or 'created'}"
+        )
+
+    @classmethod
+    def _format_task_status(cls, task: Dict[str, Any]) -> str:
+        detail = (
+            task.get("result")
+            or task.get("error")
+            or task.get("routing_diagnostic")
+            or "暂无结果"
+        )
+        route = cls._route_detail(
+            task.get("planner_agent"),
+            task.get("resolved_execution_agent") or task.get("execution_agent"),
+            task.get("resolved_worker_id") or task.get("target_worker_id"),
+            task.get("resolved_gateway_id") or task.get("target_gateway_id"),
+            task.get("resolved_profile") or task.get("target_profile"),
+        )
+        lines = [
+            f"任务：{task['id']}",
+            f"模式：{task.get('planning_mode', 'auto')}",
+            f"状态：{task['status']}",
+            f"当前阶段：{task.get('current_phase') or 'created'}",
+            *cls._stage_lines(task),
+        ]
+        if route:
+            lines.append(route)
+        if task.get("attempt_count"):
+            lines.append(
+                f"执行尝试：{task['attempt_count']}/{task.get('max_attempts', '?')}"
+            )
+        events = task.get("recent_events") or []
+        if events:
+            lines.append("最近事件：")
+            for event in events[-5:]:
+                message = event.get("message") or event.get("event_type")
+                lines.append(f"- {event.get('phase') or 'event'}：{message}")
+        lines.append(f"结果：{detail}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _stage_lines(task: Dict[str, Any]) -> List[str]:
+        status = task["status"]
+        planned = task.get("planning_mode") == "plan"
+        stages = (
+            ["规划", "排队", "执行", "结果"] if planned else ["排队", "执行", "结果"]
+        )
+        if status in ("planning_pending", "planning"):
+            active = 0
+        elif status == "pending":
+            active = 1 if planned else 0
+        elif status in ("claimed", "running", "reconciling", "cancel_requested"):
+            active = 2 if planned else 1
+        else:
+            active = len(stages) - 1
+        lines = ["进度："]
+        for index, stage in enumerate(stages):
+            if index < active:
+                marker = "✓"
+            elif index == active:
+                marker = "✓" if status == "succeeded" and stage == "结果" else "▶"
+            else:
+                marker = "○"
+            lines.append(f"{marker} {stage}")
+        return lines
 
     @staticmethod
     def _parse_new_arguments(

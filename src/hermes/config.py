@@ -96,6 +96,8 @@ class CoordinatorSettings:
     max_task_timeout_seconds: int = 7200
     default_max_attempts: int = 2
     maintenance_interval_seconds: float = 5.0
+    reconciliation_grace_seconds: int = 3600
+    reconciliation_backoff_seconds: int = 5
     default_planner_agent: str = "codex"
     planner_commands: Dict[str, List[str]] = field(
         default_factory=_default_planner_commands
@@ -127,6 +129,12 @@ class CoordinatorSettings:
             default_max_attempts=_int("HERMES_DEFAULT_MAX_ATTEMPTS", 2),
             maintenance_interval_seconds=_float(
                 "HERMES_MAINTENANCE_INTERVAL_SECONDS", 5.0
+            ),
+            reconciliation_grace_seconds=_int(
+                "HERMES_RECONCILIATION_GRACE_SECONDS", 3600
+            ),
+            reconciliation_backoff_seconds=_int(
+                "HERMES_RECONCILIATION_BACKOFF_SECONDS", 5
             ),
             default_planner_agent=os.getenv("HERMES_PLANNER_DEFAULT_AGENT", "codex"),
             planner_commands=planner_commands,

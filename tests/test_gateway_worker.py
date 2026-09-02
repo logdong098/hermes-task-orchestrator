@@ -15,6 +15,8 @@ class FakeAPI:
         self.registrations = []
         self.set_running_error = None
         self.attach_error = None
+        self.reconciliations = []
+        self.progress_updates = []
 
     async def register(self, name, max_concurrency, capabilities, metadata, **extra):
         self.registrations.append(
@@ -25,17 +27,34 @@ class FakeAPI:
     async def claim(self):
         return None
 
-    async def heartbeat(self, running_task_ids):
+    async def heartbeat(self, running_claims):
         return []
 
-    async def set_running(self, task_id):
+    async def set_running(self, task_id, claim_token):
         self.running.append(task_id)
         if self.set_running_error:
             raise self.set_running_error
         return {}
 
-    async def report(self, task_id, status, result=None, error=None, retryable=False):
-        self.reports.append((task_id, status, result, error, retryable))
+    async def report(
+        self,
+        task_id,
+        claim_token,
+        status,
+        result=None,
+        error=None,
+        retryable=False,
+        remote_run_id=None,
+    ):
+        self.reports.append((task_id, status, result, error, retryable, remote_run_id))
+        return {}
+
+    async def reconcile(self, task_id, claim_token, reason, deadline_exceeded=False):
+        self.reconciliations.append((task_id, reason, deadline_exceeded))
+        return {}
+
+    async def progress(self, task_id, claim_token, phase, message=None):
+        self.progress_updates.append((task_id, phase, message))
         return {}
 
     async def _request(self, method, path, payload=None):
@@ -89,6 +108,7 @@ def settings():
 def task(**extra):
     value = {
         "id": "task-1",
+        "claim_token": "a" * 32,
         "prompt": "do it",
         "resolved_profile": "dev",
         "attempt_count": 2,
@@ -133,6 +153,7 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(api.attached[0][2]["remote_session_id"])
         self.assertEqual("sess-from-status", api.attached[-1][2]["remote_session_id"])
         self.assertEqual("succeeded", api.reports[-1][1])
+        self.assertEqual("run-1", api.reports[-1][5])
 
     async def test_cancel_and_timeout_stop_remote_run(self):
         api = FakeAPI()
@@ -160,24 +181,37 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[missing, {"status": "succeeded", "result": "new"}]
         )
         await GatewayWorker(settings(), api, gateway).run_task(
-            task(remote_run_id="old-run")
+            task(remote_run_id="old-run", remote_run_attempt=2)
         )
         self.assertEqual([("dev", "do it", "task-1-2")], gateway.starts)
 
-    async def test_reconcile_error_stops_orphan_before_reporting(self):
+    async def test_reconcile_transport_error_preserves_remote_run(self):
         api = FakeAPI()
         request = httpx.Request("GET", "http://gateway")
         failure = httpx.ConnectError("offline", request=request)
         gateway = FakeGateway([])
         gateway.get_run = AsyncMock(side_effect=failure)
         await GatewayWorker(settings(), api, gateway).run_task(
-            task(remote_run_id="orphan")
+            task(remote_run_id="orphan", remote_run_attempt=2)
         )
-        self.assertEqual([("dev", "orphan")], gateway.stops)
-        self.assertEqual("failed", api.reports[-1][1])
-        self.assertTrue(api.reports[-1][4])
+        self.assertEqual([], gateway.stops)
+        self.assertEqual([], api.reports)
+        self.assertEqual("task-1", api.reconciliations[-1][0])
+        self.assertIn("reconciliation failed", api.reconciliations[-1][1])
 
-    async def test_poll_error_stops_started_run_before_reporting(self):
+    async def test_old_attempt_binding_is_ignored_and_new_run_starts(self):
+        api = FakeAPI()
+        gateway = FakeGateway([{"status": "succeeded", "result": "new"}])
+
+        await GatewayWorker(settings(), api, gateway).run_task(
+            task(remote_run_id="old-run", remote_run_attempt=1)
+        )
+
+        self.assertEqual([("dev", "do it", "task-1-2")], gateway.starts)
+        self.assertNotIn(("dev", "old-run"), gateway.gets)
+        self.assertEqual("run-1", api.reports[-1][5])
+
+    async def test_poll_error_enters_reconciliation_without_stopping_run(self):
         api = FakeAPI()
         request = httpx.Request("GET", "http://gateway")
         gateway = FakeGateway(
@@ -189,20 +223,86 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         await GatewayWorker(settings(), api, gateway).run_task(task())
 
-        self.assertEqual([("dev", "run-1")], gateway.stops)
-        self.assertEqual("failed", api.reports[-1][1])
-        self.assertTrue(api.reports[-1][4])
+        self.assertEqual([], gateway.stops)
+        self.assertEqual([], api.reports)
+        self.assertEqual("task-1", api.reconciliations[-1][0])
+        self.assertIn("status polling failed", api.reconciliations[-1][1])
 
-    async def test_reconcile_terminal_failure_starts_current_attempt(self):
+    async def test_session_audit_error_enters_reconciliation_without_stopping(self):
+        api = FakeAPI()
+        request = httpx.Request("POST", "http://coordinator")
+        api._request = AsyncMock(
+            side_effect=[{}, httpx.ConnectError("offline", request=request)]
+        )
+        gateway = FakeGateway(
+            [{"status": "running", "session_id": "sess-from-status"}],
+            start_session=None,
+        )
+
+        await GatewayWorker(settings(), api, gateway).run_task(task())
+
+        self.assertEqual([], gateway.stops)
+        self.assertEqual([], api.reports)
+        self.assertIn("session audit update failed", api.reconciliations[-1][1])
+
+    async def test_unconfirmed_cancellation_enters_reconciliation(self):
+        api = FakeAPI()
+        gateway = FakeGateway([])
+        worker = GatewayWorker(settings(), api, gateway)
+        worker.cancelled.add("task-1")
+        worker._stop_and_wait = AsyncMock(return_value=None)
+
+        await worker.run_task(task())
+
+        self.assertEqual([], api.reports)
+        self.assertIn("cancellation could not be confirmed", api.reconciliations[-1][1])
+
+    async def test_unconfirmed_initial_audit_does_not_requeue(self):
+        api = FakeAPI()
+        request = httpx.Request("POST", "http://coordinator")
+        api.attach_error = httpx.ConnectError("offline", request=request)
+        gateway = FakeGateway([])
+        worker = GatewayWorker(settings(), api, gateway)
+        worker._stop_and_wait = AsyncMock(return_value=None)
+
+        await worker.run_task(task())
+
+        self.assertEqual([], api.reports)
+        self.assertIn("binding is unconfirmed", api.reconciliations[-1][1])
+
+    async def test_reconcile_terminal_failure_reports_bound_run(self):
         api = FakeAPI()
         gateway = FakeGateway(
             [{"status": "failed"}, {"status": "succeeded", "result": "new"}]
         )
         await GatewayWorker(settings(), api, gateway).run_task(
-            task(remote_run_id="old-run")
+            task(remote_run_id="old-run", remote_run_attempt=2)
         )
-        self.assertEqual([("dev", "do it", "task-1-2")], gateway.starts)
-        self.assertEqual("succeeded", api.reports[-1][1])
+        self.assertEqual([], gateway.starts)
+        self.assertEqual("failed", api.reports[-1][1])
+        self.assertTrue(api.reports[-1][4])
+        self.assertEqual("old-run", api.reports[-1][5])
+
+    async def test_remote_timed_out_terminal_is_preserved(self):
+        api = FakeAPI()
+        worker = GatewayWorker(settings(), api, FakeGateway([]))
+        worker.claim_tokens["task-1"] = "a" * 32
+
+        await worker._report_gateway_terminal(
+            "task-1", "run-1", {"status": "timed_out", "error": "remote deadline"}
+        )
+
+        self.assertEqual("timed_out", api.reports[-1][1])
+        self.assertFalse(api.reports[-1][4])
+
+    async def test_failed_terminal_after_deadline_is_not_rewritten_as_timeout(self):
+        api = FakeAPI()
+        gateway = FakeGateway([{"status": "failed", "error": "remote failed"}])
+
+        await GatewayWorker(settings(), api, gateway).run_task(task(timeout_seconds=0))
+
+        self.assertEqual("failed", api.reports[-1][1])
+        self.assertEqual("remote failed", api.reports[-1][3])
 
     async def test_set_running_409_never_starts_run(self):
         api = FakeAPI()

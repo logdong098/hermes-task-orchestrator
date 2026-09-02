@@ -4,12 +4,12 @@
 
 ### 目标
 
-本项目提供一个轻量、可部署、可验证的控制平面，让一个 Telegram Director 统一管理多台机器上的开发 Agent，并把规划与执行明确分为两个阶段：
+本项目提供一个轻量、可部署、可验证的控制平面，让一个 Telegram Director 统一管理多台机器上的开发 Agent，并支持直接执行或先规划后执行：
 
 1. 用户只与一个 Director Bot 交互，能够创建、查询、取消任务并查看 Worker。
 2. Coordinator 可靠保存任务，基于 Worker 注册、心跳和并发容量完成调度。
-3. Coordinator 在本机调用 Claude Code 或 Codex 生成并持久化执行计划。
-4. Worker 根据能力领取已完成规划的任务，调用本机配置的 Claude Code、Codex 或兼容命令。
+3. 复杂任务由 Coordinator 在本机调用 Claude Code 或 Codex 生成并持久化执行计划；简单任务可跳过 Planner。
+4. Worker 根据能力领取待执行任务，调用本机配置的 Claude Code、Codex 或兼容命令。
 5. 任务不会被两个 Worker 同时领取；Worker 掉线后任务可以重试或超时终止。
 6. Telegram 完全可选，核心系统在无 Token、无真实 Agent 和无外部网络时可测试。
 7. 初期用 SQLite 降低部署成本，同时让 API 层不直接依赖 SQL，便于替换 PostgreSQL/Redis。
@@ -125,9 +125,9 @@ M1 的 `gateway-worker` Compose profile 通过 `host.docker.internal:8642` 访�
 ## 6. 任务生命周期
 
 1. 用户向 Telegram 发送 `/new` 或普通文本；也可直接调用 API。
-2. Director 创建 `planning_pending` 任务，原始 `prompt` 后续保持不变。
-3. Coordinator 领取本地规划租约，调用所选 Claude/Codex Planner。
-4. 成功后持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`。
+2. Director 根据 `planning_mode` 创建 `planning_pending` 或 `pending` 任务，原始 `prompt` 后续保持不变。
+3. `plan` 模式下 Coordinator 领取本地规划租约，调用所选 Claude/Codex Planner。
+4. 规划成功后持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`；`direct` 模式跳过这两步。
 5. 有空闲容量且兼容 `execution_agent` 的 Worker 发起 claim；若该字段为空则 Worker 使用自身默认 Agent。
 6. Worker 回报 `running`，启动本机 Agent 子进程。
 7. 心跳持续续租；Coordinator 同时返回待取消任务 ID。
@@ -256,8 +256,11 @@ Telegram 进程轮询未 ACK 通知，发送成功后再 ACK。因此交付语�
 | 输入 | 行为 |
 | --- | --- |
 | `/agents` | 列出 Worker ID、在线状态和并发 |
+| `/tasks` | 列出最近任务、状态、当前阶段和 Worker |
 | `/new [--planner claude|codex] [--agent <agent>] <任务>` | 创建任务并可指定两阶段 Agent |
-| `/status <UUID>` | 查询状态和当前结果/错误 |
+| `@worker-a <任务>` | 跳过 Planner，定向指定 Worker 执行 |
+| `@Coordinator [@worker-a] <任务>` | 先规划，再自动或定向执行 |
+| `/status <UUID>` | 查询模式、阶段、attempt、事件和结果/错误 |
 | `/cancel <UUID>` | 请求取消 |
 | `/help` | 显示命令帮助 |
 | 普通文本 | 等价于 `/new <文本>` |
@@ -312,7 +315,11 @@ Telegram 进程只需要出站访问 `api.telegram.org`。Worker 只需出站访
 
 ### `tasks`
 
-主键 UUID；保存任务输入、目标、状态、owner、执行限制、attempt、优先级、来源、幂等键、结果、时间戳与 lease。领取索引覆盖 `status/target/priority/created_at`，Worker 活跃任务索引覆盖 `claimed_by/status`，非空幂等键具有唯一索引。
+主键 UUID；保存任务输入、目标、状态、owner、执行限制、attempt、claim token、优先级、来源、幂等键、结果、时间戳与 lease。每次普通领取和对账领取都会轮换 claim token；Worker 的状态、进度、远端绑定、对账和结果写入必须携带当前 token，从而隔离复用同一 `worker_id` 的旧运行实例。领取索引覆盖 `status/target/priority/created_at`，Worker 活跃任务索引覆盖 `claimed_by/status`，非空幂等键具有唯一索引。
+
+### `task_events`
+
+追加写入任务创建、规划、领取、Worker 进度、远端 run、对账与终态事件；任务详情返回最近事件，完整历史通过独立 API 查询。
 
 ### `notifications`
 
@@ -340,6 +347,7 @@ Telegram 进程只需要出站访问 `api.telegram.org`。Worker 只需出站访
 | `POST` | `/api/v1/tasks` | 创建任务 |
 | `GET` | `/api/v1/tasks` | 最近任务列表 |
 | `GET` | `/api/v1/tasks/{id}` | 任务详情 |
+| `GET` | `/api/v1/tasks/{id}/events` | 任务进度与状态事件 |
 | `POST` | `/api/v1/tasks/{id}/cancel` | 取消任务 |
 | `GET` | `/api/v1/notifications` | 未 ACK 通知 |
 | `POST` | `/api/v1/notifications/{id}/ack` | ACK 通知 |
@@ -354,9 +362,12 @@ Header：`Authorization: Bearer <HERMES_DIRECTOR_API_KEY>`。
 | `POST` | `/api/v1/workers/{id}/heartbeat` | 心跳、续租、获取取消列表 |
 | `POST` | `/api/v1/workers/{id}/tasks/claim` | 原子领取一个任务，无任务返回 `task: null` |
 | `POST` | `/api/v1/tasks/{id}/status` | 当前只允许 `claimed -> running` |
+| `POST` | `/api/v1/tasks/{id}/progress` | 回报当前阶段与受限详情 |
+| `POST` | `/api/v1/tasks/{id}/remote-run` | 绑定 Gateway run/session 审计标识 |
+| `POST` | `/api/v1/tasks/{id}/reconcile` | 进入远端结果对账状态 |
 | `POST` | `/api/v1/tasks/{id}/result` | 回传终态和结果 |
 
-Worker API 使用前述 HMAC Header。请求/响应模型和约束可在 `/docs` 查看。
+Worker API 使用前述 HMAC Header。任务领取响应包含当前 claim token；后续任务写操作必须同时携带该 token，旧 claim 返回 `409`。请求/响应模型和约束可在 `/docs` 查看。
 
 ## 17. 配置说明
 
@@ -448,7 +459,7 @@ make e2e
 2. 使用 Redis Streams/NATS 取代轮询，保留数据库作为事实源。
 3. 密钥轮换、mTLS 和集中式 nonce/replay cache。
 4. 能力标签、资源标签、亲和/反亲和和负载感知调度。
-5. Task event 表、完整审计日志、流式输出和增量 Telegram 更新。
+5. 完整审计日志、流式输出和增量 Telegram 消息更新。
 6. 幂等创建键、Webhook Telegram 模式、通知去重标识。
 7. 多 Coordinator leader election、PostgreSQL `SKIP LOCKED` 和水平扩展。
 8. Web UI、RBAC、团队/租户和任务模板。

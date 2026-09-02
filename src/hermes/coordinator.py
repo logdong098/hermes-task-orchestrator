@@ -14,7 +14,11 @@ from .config import CoordinatorSettings
 from .models import (
     HeartbeatRequest,
     NotificationResponse,
+    PlanningMode,
     TaskCreate,
+    TaskEventResponse,
+    TaskProgressUpdate,
+    TaskReconcileRequest,
     TaskRemoteRunUpdate,
     TaskResponse,
     TaskResult,
@@ -36,6 +40,10 @@ def create_app(
 ) -> FastAPI:
     configured = settings or CoordinatorSettings.from_env()
     repository = store or SQLiteStore(configured.database_path)
+    repository.reconciliation_grace_seconds = configured.reconciliation_grace_seconds
+    repository.reconciliation_backoff_seconds = (
+        configured.reconciliation_backoff_seconds
+    )
     planner = PlannerRuntime(
         PlannerSettings(
             agent_commands=configured.planner_commands,
@@ -149,7 +157,9 @@ def create_app(
 
     def task_or_404(task_id: str) -> Dict[str, Any]:
         try:
-            return with_routing_diagnostic(repository.get_task(task_id))
+            task = with_routing_diagnostic(repository.get_task(task_id))
+            task["recent_events"] = repository.list_task_events(task_id, limit=8)
+            return task
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -228,6 +238,9 @@ def create_app(
                     if heartbeat_request.routes is not None
                     else None
                 ),
+                running_claims=[
+                    claim.model_dump() for claim in heartbeat_request.running_claims
+                ],
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -257,8 +270,15 @@ def create_app(
     )
     def create_task(task: TaskCreate) -> Dict[str, Any]:
         payload = task.model_dump(mode="json")
+        requested_mode = task.planning_mode
+        resolved_mode = (
+            PlanningMode.PLAN if requested_mode == PlanningMode.AUTO else requested_mode
+        )
+        payload["planning_mode"] = resolved_mode.value
         payload["planner_agent"] = (
             payload.get("planner_agent") or configured.default_planner_agent
+            if resolved_mode == PlanningMode.PLAN
+            else None
         )
         return repository.create_task(
             payload,
@@ -286,6 +306,17 @@ def create_app(
     )
     def get_task(task_id: str) -> Dict[str, Any]:
         return task_or_404(task_id)
+
+    @app.get(
+        "/api/v1/tasks/{task_id}/events",
+        response_model=List[TaskEventResponse],
+        dependencies=[Depends(director_auth)],
+    )
+    def list_task_events(task_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        try:
+            return repository.list_task_events(task_id, limit=limit)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/tasks/{task_id}/cancel",
@@ -321,7 +352,49 @@ def create_app(
     ) -> Dict[str, Any]:
         try:
             return repository.update_task_status(
-                task_id, authenticated_worker_id, update.status.value
+                task_id,
+                authenticated_worker_id,
+                update.status.value,
+                claim_token=update.claim_token,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tasks/{task_id}/progress", response_model=TaskResponse)
+    def report_progress(
+        task_id: str,
+        update: TaskProgressUpdate,
+        authenticated_worker_id: str = Depends(worker_auth),
+    ) -> Dict[str, Any]:
+        try:
+            return repository.record_progress(
+                task_id,
+                authenticated_worker_id,
+                update.phase,
+                update.message,
+                update.details,
+                claim_token=update.claim_token,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tasks/{task_id}/reconcile", response_model=TaskResponse)
+    def mark_task_reconciling(
+        task_id: str,
+        update: TaskReconcileRequest,
+        authenticated_worker_id: str = Depends(worker_auth),
+    ) -> Dict[str, Any]:
+        try:
+            return repository.mark_reconciling(
+                task_id,
+                authenticated_worker_id,
+                update.reason,
+                update.deadline_exceeded,
+                claim_token=update.claim_token,
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -340,6 +413,7 @@ def create_app(
                 authenticated_worker_id,
                 update.remote_run_id,
                 update.remote_session_id,
+                claim_token=update.claim_token,
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -360,6 +434,8 @@ def create_app(
                 task_result.result,
                 task_result.error,
                 task_result.retryable,
+                task_result.remote_run_id,
+                claim_token=task_result.claim_token,
             )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

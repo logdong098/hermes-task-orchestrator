@@ -23,6 +23,16 @@ class FakeDirector:
             }
         ]
 
+    async def list_tasks(self, limit=20):
+        return [
+            {
+                "id": "task-1",
+                "status": "running",
+                "current_phase": "process_started",
+                "resolved_worker_id": "worker-a",
+            }
+        ][:limit]
+
     async def create_task(
         self,
         prompt,
@@ -34,6 +44,7 @@ class FakeDirector:
         target_worker_id=None,
         target_gateway_id=None,
         target_profile=None,
+        planning_mode="auto",
     ):
         self.created.append(
             (
@@ -45,12 +56,33 @@ class FakeDirector:
                 target_worker_id,
                 target_gateway_id,
                 target_profile,
+                planning_mode,
             )
         )
-        return {"id": "task-1", "status": "pending"}
+        return {
+            "id": "task-1",
+            "status": "planning_pending" if planning_mode == "plan" else "pending",
+            "planning_mode": planning_mode,
+            "current_phase": "planning" if planning_mode == "plan" else "queued",
+        }
 
     async def get_task(self, task_id):
-        return {"id": task_id, "status": "succeeded", "result": "done"}
+        return {
+            "id": task_id,
+            "status": "succeeded",
+            "result": "done",
+            "planning_mode": "direct",
+            "current_phase": "completed",
+            "attempt_count": 1,
+            "max_attempts": 2,
+            "recent_events": [
+                {
+                    "event_type": "task_finished",
+                    "phase": "completed",
+                    "message": "task completed",
+                }
+            ],
+        }
 
     async def cancel_task(self, task_id):
         return {"id": task_id, "status": "cancel_requested"}
@@ -85,6 +117,8 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("plain task", self.director.created[-1][0])
         self.assertIsNone(self.director.created[-1][3])
         self.assertIsNone(self.director.created[-1][4])
+        tasks = await self.bot.handle_text("/tasks", 42, 100)
+        self.assertIn("process_started", tasks)
 
     async def test_new_routes_planner_and_execution_agent(self) -> None:
         created = await self.bot.handle_text(
@@ -129,6 +163,41 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         response = await self.bot.handle_text("/new\timplement tab parsing", 42, 100)
         self.assertIn("task-1", response)
         self.assertEqual("implement tab parsing", self.director.created[-1][0])
+
+    async def test_worker_mention_creates_direct_targeted_task(self) -> None:
+        response = await self.bot.handle_text("@worker-a fix login failure", 42, 100)
+        self.assertIn("直接执行", response)
+        self.assertEqual("fix login failure", self.director.created[-1][0])
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("direct", self.director.created[-1][8])
+
+    async def test_coordinator_and_worker_mentions_create_planned_task(self) -> None:
+        response = await self.bot.handle_text(
+            "@worker-a @Coordinator analyze then implement", 42, 100
+        )
+        self.assertIn("先规划后执行", response)
+        self.assertEqual("analyze then implement", self.director.created[-1][0])
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("plan", self.director.created[-1][8])
+
+    async def test_unknown_and_multiple_workers_are_rejected(self) -> None:
+        before = len(self.director.created)
+        unknown = await self.bot.handle_text("@missing do work", 42, 100)
+        self.assertIn("未知 Worker", unknown)
+        multiple = await self.bot.handle_text("@worker-a @worker-b do work", 42, 100)
+        self.assertIn("一次只能指定一个 Worker", multiple)
+        self.assertEqual(before, len(self.director.created))
+
+    async def test_duplicate_worker_mention_is_rejected(self) -> None:
+        before = len(self.director.created)
+        response = await self.bot.handle_text("@worker-a @worker-a do work", 42, 100)
+        self.assertIn("只能指定一次", response)
+        self.assertEqual(before, len(self.director.created))
+
+    async def test_mentions_after_prompt_are_not_routing_directives(self) -> None:
+        await self.bot.handle_text("tell @worker-a about this", 42, 100)
+        self.assertEqual("tell @worker-a about this", self.director.created[-1][0])
+        self.assertEqual("auto", self.director.created[-1][8])
 
     async def test_allowlist_rejects_unknown_user(self) -> None:
         await self.bot.handle_update(

@@ -131,9 +131,33 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("architect", claimed["resolved_profile"])
         self.assertEqual("hermes", claimed["resolved_execution_agent"])
 
+        missing_fence = await self.worker_post(
+            f"/api/v1/tasks/{task['id']}/progress",
+            {"phase": "stale"},
+        )
+        self.assertEqual(422, missing_fence.status_code)
+        stale_fence = await self.worker_post(
+            f"/api/v1/tasks/{task['id']}/progress",
+            {"claim_token": "b" * 32, "phase": "stale"},
+        )
+        self.assertEqual(409, stale_fence.status_code)
+
+        response = await self.worker_post(
+            f"/api/v1/tasks/{task['id']}/progress",
+            {
+                "claim_token": claimed["claim_token"],
+                "phase": "starting_remote_run",
+                "message": "starting remote run",
+                "details": {"attempt": 1},
+            },
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual("starting_remote_run", response.json()["current_phase"])
+
         response = await self.worker_post(
             f"/api/v1/tasks/{task['id']}/remote-run",
             {
+                "claim_token": claimed["claim_token"],
                 "remote_run_id": "run-123",
                 "remote_session_id": "session-123",
             },
@@ -141,6 +165,21 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, response.status_code, response.text)
         self.assertEqual("run-123", response.json()["remote_run_id"])
         self.assertEqual("session-123", response.json()["remote_session_id"])
+
+        events = await self.client.get(
+            f"/api/v1/tasks/{task['id']}/events",
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(200, events.status_code, events.text)
+        self.assertEqual(
+            [
+                "task_created",
+                "task_claimed",
+                "worker_progress",
+                "remote_run_attached",
+            ],
+            [event["event_type"] for event in events.json()],
+        )
 
     async def test_pending_exact_task_reports_unavailable_route(self) -> None:
         task = self.store.create_task(

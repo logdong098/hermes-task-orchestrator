@@ -90,11 +90,11 @@ class WorkerAPI:
             },
         )
 
-    async def heartbeat(self, running_task_ids: List[str]) -> List[str]:
+    async def heartbeat(self, running_claims: List[Dict[str, str]]) -> List[str]:
         response = await self._request(
             "POST",
             f"/api/v1/workers/{self.worker_id}/heartbeat",
-            {"running_task_ids": running_task_ids},
+            {"running_claims": running_claims},
         )
         return response.get("cancel_task_ids", [])
 
@@ -105,29 +105,69 @@ class WorkerAPI:
         )
         return response.get("task")
 
-    async def set_running(self, task_id: str) -> Dict[str, Any]:
+    async def set_running(self, task_id: str, claim_token: str) -> Dict[str, Any]:
         return await self._request(
             "POST",
             f"/api/v1/tasks/{task_id}/status",
-            {"status": "running"},
+            {"status": "running", "claim_token": claim_token},
+        )
+
+    async def progress(
+        self,
+        task_id: str,
+        claim_token: str,
+        phase: str,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/api/v1/tasks/{task_id}/progress",
+            {
+                "claim_token": claim_token,
+                "phase": phase,
+                "message": message,
+                "details": details or {},
+            },
+        )
+
+    async def reconcile(
+        self,
+        task_id: str,
+        claim_token: str,
+        reason: str,
+        deadline_exceeded: bool = False,
+    ) -> Dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/api/v1/tasks/{task_id}/reconcile",
+            {
+                "claim_token": claim_token,
+                "reason": reason,
+                "deadline_exceeded": deadline_exceeded,
+            },
         )
 
     async def report(
         self,
         task_id: str,
+        claim_token: str,
         status: str,
         result: Optional[str] = None,
         error: Optional[str] = None,
         retryable: bool = False,
+        remote_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self._request(
             "POST",
             f"/api/v1/tasks/{task_id}/result",
             {
+                "claim_token": claim_token,
                 "status": status,
                 "result": result,
                 "error": error,
                 "retryable": retryable,
+                "remote_run_id": remote_run_id,
             },
         )
 
@@ -138,6 +178,7 @@ class WorkerRuntime:
         self.api = api
         self.allowed_workdir = Path(settings.allowed_workdir).resolve()
         self.active: Dict[str, asyncio.Task[None]] = {}
+        self.claim_tokens: Dict[str, str] = {}
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self.cancelled: Set[str] = set()
         self.stopping = asyncio.Event()
@@ -200,6 +241,21 @@ class WorkerRuntime:
         agents.add(self.settings.default_agent)
         return [f"agent:{agent}" for agent in sorted(agents)]
 
+    async def _progress(
+        self,
+        task_id: str,
+        claim_token: str,
+        phase: str,
+        message: Optional[str] = None,
+    ) -> None:
+        reporter = getattr(self.api, "progress", None)
+        if reporter is None:
+            return
+        try:
+            await reporter(task_id, claim_token, phase, message)
+        except httpx.HTTPError:
+            LOGGER.warning("could not report progress for task %s", task_id)
+
     @staticmethod
     async def _read_limited(
         stream: Optional[asyncio.StreamReader], limit: int = MAX_CAPTURE_BYTES
@@ -223,21 +279,31 @@ class WorkerRuntime:
 
     async def run_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
+        claim_token = task["claim_token"]
         try:
             if task_id in self.cancelled:
                 await self.api.report(
-                    task_id, "cancelled", error="cancelled before start"
+                    task_id,
+                    claim_token,
+                    "cancelled",
+                    error="cancelled before start",
                 )
                 return
             try:
-                await self.api.set_running(task_id)
+                await self.api.set_running(task_id, claim_token)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
                     await self.api.report(
-                        task_id, "cancelled", error="cancelled before start"
+                        task_id,
+                        claim_token,
+                        "cancelled",
+                        error="cancelled before start",
                     )
                     return
                 raise
+            await self._progress(
+                task_id, claim_token, "preparing", "preparing local execution"
+            )
             workdir = self.resolve_workdir(task.get("workdir"))
             prompt = task.get("execution_prompt") or task["prompt"]
             command = self.command_for(prompt, task.get("execution_agent"))
@@ -254,6 +320,9 @@ class WorkerRuntime:
                 **process_options,
             )
             self.processes[task_id] = process
+            await self._progress(
+                task_id, claim_token, "process_started", "local process started"
+            )
             stdout_task = asyncio.create_task(self._read_limited(process.stdout))
             stderr_task = asyncio.create_task(self._read_limited(process.stderr))
             if task_id in self.cancelled:
@@ -268,10 +337,17 @@ class WorkerRuntime:
             except asyncio.TimeoutError:
                 timed_out = True
                 await self._terminate_process(task_id)
+            await self._progress(
+                task_id,
+                claim_token,
+                "collecting_result",
+                "collecting process output",
+            )
             stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
             if timed_out:
                 await self.api.report(
                     task_id,
+                    claim_token,
                     "timed_out",
                     error=f"local execution exceeded {timeout} seconds",
                 )
@@ -280,13 +356,17 @@ class WorkerRuntime:
             error_output = stderr.decode("utf-8", errors="replace")
             if task_id in self.cancelled:
                 await self.api.report(
-                    task_id, "cancelled", error="cancelled by director"
+                    task_id,
+                    claim_token,
+                    "cancelled",
+                    error="cancelled by director",
                 )
             elif process.returncode == 0:
-                await self.api.report(task_id, "succeeded", result=output)
+                await self.api.report(task_id, claim_token, "succeeded", result=output)
             else:
                 await self.api.report(
                     task_id,
+                    claim_token,
                     "failed",
                     result=output or None,
                     error=error_output or f"command exited with {process.returncode}",
@@ -295,6 +375,7 @@ class WorkerRuntime:
         except (FileNotFoundError, PermissionError, ValueError) as exc:
             await self.api.report(
                 task_id,
+                claim_token,
                 "failed",
                 error=f"worker execution error: {exc}",
                 retryable=False,
@@ -306,6 +387,7 @@ class WorkerRuntime:
             try:
                 await self.api.report(
                     task_id,
+                    claim_token,
                     "failed",
                     error="worker internal error; inspect worker logs",
                     retryable=False,
@@ -348,7 +430,12 @@ class WorkerRuntime:
     async def heartbeat_loop(self) -> None:
         while not self.stopping.is_set():
             try:
-                cancel_task_ids = await self.api.heartbeat(list(self.active))
+                running_claims = [
+                    {"task_id": task_id, "claim_token": claim_token}
+                    for task_id, claim_token in self.claim_tokens.items()
+                    if task_id in self.active
+                ]
+                cancel_task_ids = await self.api.heartbeat(running_claims)
                 for task_id in cancel_task_ids:
                     await self.cancel_task(task_id)
             except Exception:
@@ -363,6 +450,7 @@ class WorkerRuntime:
 
     def _task_done(self, task_id: str, _: asyncio.Task[None]) -> None:
         self.active.pop(task_id, None)
+        self.claim_tokens.pop(task_id, None)
 
     async def run(self, once: bool = False) -> None:
         await self.api.register(
@@ -384,6 +472,7 @@ class WorkerRuntime:
                         break
                     claimed_any = True
                     task_id = task["id"]
+                    self.claim_tokens[task_id] = task["claim_token"]
                     running = asyncio.create_task(self.run_task(task))
                     self.active[task_id] = running
                     running.add_done_callback(

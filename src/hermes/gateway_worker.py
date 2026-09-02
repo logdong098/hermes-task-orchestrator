@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -32,6 +33,7 @@ class GatewayWorker:
     ) -> None:
         self.settings, self.api, self.gateway = settings, api, gateway
         self.active: Dict[str, asyncio.Task[None]] = {}
+        self.claim_tokens: Dict[str, str] = {}
         self.cancelled: set[str] = set()
         self.stopping = asyncio.Event()
         if not settings.worker_id or not settings.shared_secret:
@@ -53,7 +55,11 @@ class GatewayWorker:
         await self.api._request(
             "POST",
             f"/api/v1/tasks/{task_id}/remote-run",
-            {"remote_run_id": run_id, "remote_session_id": session_id},
+            {
+                "claim_token": self.claim_tokens[task_id],
+                "remote_run_id": run_id,
+                "remote_session_id": session_id,
+            },
         )
 
     async def _profile(self, task: Dict[str, Any]) -> str:
@@ -105,6 +111,7 @@ class GatewayWorker:
         try:
             await self.api.report(
                 task_id,
+                self.claim_tokens[task_id],
                 "cancelled",
                 error="Coordinator no longer accepts remote run audit updates",
             )
@@ -113,12 +120,109 @@ class GatewayWorker:
                 "Coordinator also rejected cancellation for stale task %s", task_id
             )
 
+    async def _progress(
+        self, task_id: str, phase: str, message: Optional[str] = None
+    ) -> None:
+        reporter = getattr(self.api, "progress", None)
+        if reporter is None:
+            return
+        try:
+            await reporter(task_id, self.claim_tokens[task_id], phase, message)
+        except httpx.HTTPError:
+            LOGGER.warning("could not report progress for Gateway task %s", task_id)
+
+    async def _mark_reconciling(
+        self, task_id: str, reason: str, deadline_exceeded: bool = False
+    ) -> None:
+        reporter = getattr(self.api, "reconcile", None)
+        if reporter is None:
+            LOGGER.error("Coordinator client cannot mark task %s reconciling", task_id)
+            return
+        try:
+            await reporter(
+                task_id,
+                self.claim_tokens[task_id],
+                reason,
+                deadline_exceeded,
+            )
+        except httpx.HTTPError:
+            LOGGER.warning("could not mark Gateway task %s reconciling", task_id)
+
+    async def _report_remote(
+        self,
+        task_id: str,
+        run_id: str,
+        status: str,
+        *,
+        result: Optional[str] = None,
+        error: Optional[str] = None,
+        retryable: bool = False,
+    ) -> None:
+        await self.api.report(
+            task_id,
+            self.claim_tokens[task_id],
+            status,
+            result=result,
+            error=error,
+            retryable=retryable,
+            remote_run_id=run_id,
+        )
+
+    async def _report_gateway_terminal(
+        self, task_id: str, run_id: str, run: Dict[str, Any]
+    ) -> None:
+        status = self._status(run)
+        result = run.get("result", run.get("output"))
+        error = run.get("error")
+        if status in {"succeeded", "completed"}:
+            await self._report_remote(
+                task_id,
+                run_id,
+                "succeeded",
+                result=str(result) if result is not None else "",
+            )
+        elif status == "cancelled":
+            await self._report_remote(
+                task_id,
+                run_id,
+                "cancelled",
+                error=str(error or "Gateway run cancelled"),
+            )
+        elif status == "timed_out":
+            await self._report_remote(
+                task_id,
+                run_id,
+                "timed_out",
+                result=str(result) if result else None,
+                error=str(error or "Gateway run timed out"),
+            )
+        else:
+            await self._report_remote(
+                task_id,
+                run_id,
+                "failed",
+                result=str(result) if result else None,
+                error=str(error or f"Gateway run ended with {status}"),
+                retryable=True,
+            )
+
     async def run_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
+        self.claim_tokens[task_id] = task["claim_token"]
+        run_id = task.get("remote_run_id")
+        attempt = task.get("attempt_count", 1)
+        if run_id and task.get("remote_run_attempt") != attempt:
+            LOGGER.warning(
+                "ignoring Gateway run %s from an older attempt of %s",
+                run_id,
+                task_id,
+            )
+            run_id = None
+        remote_bound = bool(run_id)
         try:
             profile = await self._profile(task)
             try:
-                await self.api.set_running(task_id)
+                await self.api.set_running(task_id, self.claim_tokens[task_id])
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
                     LOGGER.warning(
@@ -126,43 +230,74 @@ class GatewayWorker:
                     )
                     return
                 raise
+            await self._progress(task_id, "preparing", "preparing Gateway execution")
             prompt = task.get("execution_prompt") or task["prompt"]
-            attempt = task.get("attempt_count", 1)
-            run_id = task.get("remote_run_id")
             attached_session_id = task.get("remote_session_id")
             if run_id:
                 try:
                     run = await self.gateway.get_run(profile, run_id)
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code == 404:
+                        if task.get("deadline_exceeded_at"):
+                            await self._mark_reconciling(
+                                task_id,
+                                "remote run is not visible after execution deadline",
+                                deadline_exceeded=True,
+                            )
+                            return
                         run_id = None
+                        remote_bound = False
                     else:
-                        await self._best_effort_stop(
-                            profile, str(run_id), "reconcile failure"
+                        await self._mark_reconciling(
+                            task_id, f"Gateway reconciliation failed: {exc}"
                         )
-                        raise
-                except httpx.HTTPError:
-                    await self._best_effort_stop(
-                        profile, str(run_id), "reconcile failure"
+                        return
+                except httpx.HTTPError as exc:
+                    await self._mark_reconciling(
+                        task_id, f"Gateway reconciliation failed: {exc}"
                     )
-                    raise
+                    return
                 else:
                     previous_status = self._status(run)
-                    if previous_status in TERMINAL and previous_status not in {
-                        "succeeded",
-                        "completed",
-                    }:
-                        run_id = None
-                        run = {}
+                    if previous_status in TERMINAL:
+                        await self._report_gateway_terminal(task_id, str(run_id), run)
+                        return
             else:
                 run = {}
+            if task.get("cancel_requested_at") and run_id:
+                await self._progress(
+                    task_id, "stopping", "stopping remote run after cancellation"
+                )
+                try:
+                    stopped = await self._stop_and_wait(profile, str(run_id))
+                except httpx.HTTPError as exc:
+                    await self._mark_reconciling(
+                        task_id, f"remote cancellation could not be confirmed: {exc}"
+                    )
+                    return
+                if stopped is None:
+                    await self._mark_reconciling(
+                        task_id, "remote cancellation could not be confirmed"
+                    )
+                    return
+                await self._report_remote(
+                    task_id,
+                    str(run_id),
+                    "cancelled",
+                    error="cancelled by director",
+                )
+                return
             if not run_id:
+                await self._progress(
+                    task_id, "starting_remote_run", "starting remote Gateway run"
+                )
                 run = await self.gateway.start_run(
                     profile, prompt, f"{task_id}-{attempt}"
                 )
                 run_id = run.get("run_id", run.get("id"))
                 if not run_id:
                     raise ValueError("Gateway start response has no run id")
+                remote_bound = True
                 try:
                     await self._attach(
                         task_id,
@@ -175,118 +310,194 @@ class GatewayWorker:
                             task_id, profile, str(run_id)
                         )
                         return
-                    await self._best_effort_stop(
+                    stopped = await self._best_effort_stop(
                         profile, str(run_id), "remote-run audit failure"
                     )
-                    raise
-                except httpx.HTTPError:
-                    await self._best_effort_stop(
+                    if stopped is None:
+                        await self._mark_reconciling(
+                            task_id,
+                            f"remote run started but audit binding failed: {exc}",
+                        )
+                        return
+                    await self.api.report(
+                        task_id,
+                        self.claim_tokens[task_id],
+                        "failed",
+                        error=f"remote run audit failed after run was stopped: {exc}",
+                        retryable=True,
+                    )
+                    return
+                except httpx.HTTPError as exc:
+                    stopped = await self._best_effort_stop(
                         profile, str(run_id), "remote-run audit failure"
                     )
-                    raise
+                    if stopped is None:
+                        try:
+                            await self._attach(
+                                task_id,
+                                str(run_id),
+                                self._session_id(run),
+                            )
+                        except httpx.HTTPError:
+                            pass
+                        await self._mark_reconciling(
+                            task_id,
+                            f"remote run started but audit binding is unconfirmed: {exc}",
+                        )
+                        return
+                    try:
+                        await self.api.report(
+                            task_id,
+                            self.claim_tokens[task_id],
+                            "failed",
+                            error=(
+                                "remote run audit failed after the run was "
+                                f"confirmed stopped: {exc}"
+                            ),
+                            retryable=True,
+                        )
+                    except httpx.HTTPError:
+                        await self._mark_reconciling(
+                            task_id,
+                            "remote run audit outcome is ambiguous after a transport failure",
+                        )
+                    return
                 attached_session_id = self._session_id(run)
-            deadline = asyncio.get_running_loop().time() + min(
+            await self._progress(
+                task_id, "remote_running", f"remote run {run_id} is active"
+            )
+            timeout_seconds = min(
                 int(task.get("timeout_seconds", self.settings.task_timeout_seconds)),
                 self.settings.task_timeout_seconds,
             )
+            started_at = float(task.get("started_at") or time.time())
+            remaining = max(0.0, started_at + timeout_seconds - time.time())
+            deadline = asyncio.get_running_loop().time() + remaining
             while True:
                 session_id = self._session_id(run)
                 if session_id and session_id != attached_session_id:
                     try:
                         await self._attach(task_id, str(run_id), session_id)
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code == 409:
-                            await self._handle_binding_conflict(
-                                task_id, profile, str(run_id)
-                            )
-                            return
-                        await self._best_effort_stop(
-                            profile, str(run_id), "session audit failure"
+                    except httpx.HTTPError as exc:
+                        await self._mark_reconciling(
+                            task_id,
+                            f"remote session audit update failed: {exc}",
                         )
-                        raise
+                        return
                     attached_session_id = session_id
                 status = self._status(run)
                 if task_id in self.cancelled:
                     if status not in TERMINAL:
                         stopped = await self._stop_and_wait(profile, str(run_id))
                         if stopped is None:
-                            LOGGER.error(
-                                "Gateway run %s did not stop before the grace deadline",
-                                run_id,
+                            await self._mark_reconciling(
+                                task_id,
+                                "remote cancellation could not be confirmed",
                             )
                             return
-                    await self.api.report(
-                        task_id, "cancelled", error="cancelled by director"
+                    await self._report_remote(
+                        task_id,
+                        str(run_id),
+                        "cancelled",
+                        error="cancelled by director",
                     )
                     return
                 if status in TERMINAL:
                     break
                 if asyncio.get_running_loop().time() >= deadline:
-                    stopped = await self._stop_and_wait(profile, str(run_id))
-                    if stopped is None:
-                        LOGGER.error(
-                            "Timed-out Gateway run %s did not stop before the grace deadline",
-                            run_id,
+                    await self._progress(
+                        task_id,
+                        "stopping",
+                        "execution deadline reached; stopping remote run",
+                    )
+                    try:
+                        stopped = await self._stop_and_wait(profile, str(run_id))
+                    except httpx.HTTPError as exc:
+                        await self._mark_reconciling(
+                            task_id,
+                            f"execution deadline reached; stop unconfirmed: {exc}",
+                            deadline_exceeded=True,
                         )
                         return
-                    await self.api.report(
-                        task_id, "timed_out", error="Gateway execution timed out"
-                    )
+                    if stopped is None:
+                        await self._mark_reconciling(
+                            task_id,
+                            "execution deadline reached; stop unconfirmed",
+                            deadline_exceeded=True,
+                        )
+                        return
+                    stopped_status = self._status(stopped)
+                    if stopped_status in {"cancelled", "interrupted"}:
+                        await self._report_remote(
+                            task_id,
+                            str(run_id),
+                            "timed_out",
+                            error="Gateway execution timed out",
+                        )
+                    else:
+                        await self._report_gateway_terminal(
+                            task_id, str(run_id), stopped
+                        )
                     return
                 await asyncio.sleep(self.settings.gateway_poll_interval_seconds)
                 try:
                     run = await self.gateway.get_run(profile, str(run_id))
-                except httpx.HTTPError:
-                    await self._best_effort_stop(
-                        profile, str(run_id), "status polling failure"
+                except httpx.HTTPError as exc:
+                    await self._mark_reconciling(
+                        task_id, f"Gateway status polling failed: {exc}"
                     )
-                    raise
-            result = run.get("result", run.get("output"))
-            error = run.get("error")
-            if status in {"succeeded", "completed"}:
-                await self.api.report(
-                    task_id,
-                    "succeeded",
-                    result=str(result) if result is not None else "",
-                )
-            elif status == "cancelled":
-                await self.api.report(
-                    task_id, "cancelled", error=str(error or "Gateway run cancelled")
-                )
-            else:
-                await self.api.report(
-                    task_id,
-                    "failed",
-                    result=str(result) if result else None,
-                    error=str(error or f"Gateway run ended with {status}"),
-                    retryable=True,
-                )
+                    return
+            await self._progress(
+                task_id, "collecting_result", "collecting Gateway result"
+            )
+            await self._report_gateway_terminal(task_id, str(run_id), run)
         except httpx.HTTPError as exc:
             LOGGER.exception("Gateway communication failed for %s", task_id)
-            try:
-                await self.api.report(
-                    task_id,
-                    "failed",
-                    error=f"Gateway communication failed: {exc}",
-                    retryable=True,
+            if remote_bound:
+                await self._mark_reconciling(
+                    task_id, f"Gateway communication failed: {exc}"
                 )
-            except Exception:
-                LOGGER.exception("could not report Gateway failure")
+            else:
+                try:
+                    await self.api.report(
+                        task_id,
+                        self.claim_tokens[task_id],
+                        "failed",
+                        error=f"Gateway communication failed before run binding: {exc}",
+                        retryable=True,
+                    )
+                except Exception:
+                    LOGGER.exception("could not report Gateway failure")
         except Exception as exc:
             LOGGER.exception("Gateway task failed: %s", task_id)
-            try:
-                await self.api.report(
-                    task_id, "failed", error=str(exc), retryable=False
+            if remote_bound:
+                await self._mark_reconciling(
+                    task_id, f"Gateway worker lost control of remote run: {exc}"
                 )
-            except Exception:
-                LOGGER.exception("could not report task failure")
+            else:
+                try:
+                    await self.api.report(
+                        task_id,
+                        self.claim_tokens[task_id],
+                        "failed",
+                        error=str(exc),
+                        retryable=False,
+                    )
+                except Exception:
+                    LOGGER.exception("could not report task failure")
         finally:
             self.cancelled.discard(task_id)
+            self.claim_tokens.pop(task_id, None)
 
     async def heartbeat_loop(self) -> None:
         while not self.stopping.is_set():
             try:
-                ids = await self.api.heartbeat(list(self.active))
+                running_claims = [
+                    {"task_id": task_id, "claim_token": claim_token}
+                    for task_id, claim_token in self.claim_tokens.items()
+                    if task_id in self.active
+                ]
+                ids = await self.api.heartbeat(running_claims)
                 self.cancelled.update(ids)
             except Exception:
                 LOGGER.exception("heartbeat failed")

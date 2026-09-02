@@ -1,6 +1,6 @@
 # hermes
 
-`hermes` 是一个可运行的两阶段分布式开发任务调度 MVP：用户通过 Telegram Director Bot 或 API 提交任务，Coordinator 先在本机调用 Claude Code 或 Codex 生成执行计划，再把带计划的任务可靠地分配给 Worker。用户可以指定执行 Agent；未指定时由领取任务的 Worker 使用本机默认 Agent。
+`hermes` 是一个可运行的分布式开发任务调度 MVP：用户通过 Telegram Director Bot 或 API 提交任务，简单任务可直接交给 Worker，复杂任务可先由 Coordinator 在本机调用 Claude Code 或 Codex 生成执行计划，再可靠地分配给 Worker。用户可以指定执行 Agent；未指定时由领取任务的 Worker 使用本机默认 Agent。
 
 核心 Coordinator 与 Worker 不依赖 Telegram。没有 Bot Token、没有真实 Hermes CLI 时，也可以使用内置 mock 完成测试和端到端流程。
 
@@ -10,7 +10,7 @@
 
 - `coordinator`：FastAPI + SQLite，负责认证 API、任务状态机，并在本机运行 Claude/Codex Planner。
 - `worker`：按 Agent 能力领取任务，以无 shell的参数数组启动本机 Agent，支持并发、超时和取消。
-- `telegram`：单个 Director Bot，提供 `/agents`、`/new`、`/status`、`/cancel`、`/help`，并推送结果。
+- `telegram`：单个 Director Bot，提供 `/agents`、`/tasks`、`/new`、`/status`、`/cancel`、`/help`，并推送结果。
 - `mock_hermes`：不访问外部服务的假 Hermes 命令，仅用于开发和测试。
 
 M0/M1 还提供 `gateway-worker`：它是无 GUI 的 Hermes Gateway 适配 Worker，直接访问 Worker 所在机器上的 Hermes API Server（默认 `8642`），按 `(gateway_id, profile)` 注册和领取任务。Hermes Desktop 不是运行依赖；M2 Desktop Fleet Plugin、M3 自动路由与 `task_attempts` 历史审计、M4 Bridge/delegation 当前均未实现。
@@ -169,6 +169,17 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -d '{"prompt":"请总结当前目录结构","timeout_seconds":120}'
 ```
 
+API 默认保持兼容，`planning_mode=auto` 会先规划。简单任务可显式跳过 Planner：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
+  -H "Authorization: Bearer ${DIRECTOR_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"修复登录页文案","planning_mode":"direct","target_worker_id":"worker-a"}'
+```
+
+`planning_mode` 可取 `auto`、`plan`、`direct`；`direct` 不能同时指定 `planner_agent`。
+
 指定 Planner 和执行 Agent：
 
 ```bash
@@ -195,6 +206,15 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
 curl -sS http://127.0.0.1:8000/api/v1/tasks/<TASK_ID> \
   -H "Authorization: Bearer ${DIRECTOR_KEY}"
 ```
+
+任务详情包含最近事件；完整进度事件可单独查询：
+
+```bash
+curl -sS http://127.0.0.1:8000/api/v1/tasks/<TASK_ID>/events \
+  -H "Authorization: Bearer ${DIRECTOR_KEY}"
+```
+
+Gateway 网络或轮询短暂失败时，任务会进入 `reconciling`，保留当前远端 run 并继续对账。超过 `HERMES_RECONCILIATION_GRACE_SECONDS` 后才按最终状态收敛；重试间隔由 `HERMES_RECONCILIATION_BACKOFF_SECONDS` 控制。每次普通领取或对账领取都会生成新的 claim token，旧进程即使复用同一个 `worker_id` 也不能更新新 claim。取消已请求但远端结果始终无法确认时，最终显示为 `timed_out` 并保留“结果未知”诊断，不会虚假显示为已取消。
 
 取消任务：
 
@@ -231,11 +251,16 @@ make telegram
 
 Telegram Bot 默认收不到其他 Bot 发送的消息。因此本项目不把多个 Bot 的群聊当作协作总线，而是只使用一个面向人的 Director Bot；机器间通信全部通过 Coordinator 的认证 API。
 
-创建任务命令支持两种可选路由参数：
+创建任务既支持兼容的 `/new` 参数，也支持更短的 `@` 指令：
 
 ```text
 /new [--planner claude|codex] [--agent <agent>] <任务描述>
+@worker-a 修复登录页文案并运行相关测试
+@Coordinator 分析这个开发计划并给出执行方案
+@Coordinator @worker-a 分析并由指定 Worker 实现登录模块
 ```
+
+`@worker-a` 使用 `direct` 模式，跳过 Planner，但任务仍由 Coordinator 持久化、鉴权、调度和跟踪。`@Coordinator` 使用 `plan` 模式；它与 Worker 的先后顺序可以互换。当前 P0/P1 一条任务只允许一个 Worker，`->`、多 Worker DAG 和工作流编排暂未实现。
 
 M1 Telegram 路由语法为：
 
@@ -244,6 +269,8 @@ M1 Telegram 路由语法为：
 ```
 
 `--executor` 是执行器；旧的 `--agent` 仍作为兼容别名。`--gateway` 和 `--profile` 必须成对出现。
+
+使用 `/tasks` 查看最近任务及当前阶段，使用 `/status <任务ID>` 查看规划/执行模式、阶段标记、attempt、最近事件和最终结果。P1 采用按需查询与终态通知，不会持续编辑原 Telegram 消息。
 
 ## 测试和验证
 

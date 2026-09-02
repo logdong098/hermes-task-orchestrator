@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,7 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     CLAIMED = "claimed"
     RUNNING = "running"
+    RECONCILING = "reconciling"
     CANCEL_REQUESTED = "cancel_requested"
     CANCELLED = "cancelled"
     SUCCEEDED = "succeeded"
@@ -77,8 +79,14 @@ class WorkerRoute(BaseModel):
         return value.strip() if value is not None else None
 
 
+class RunningClaim(BaseModel):
+    task_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=32, max_length=128)
+
+
 class HeartbeatRequest(BaseModel):
     running_task_ids: List[str] = Field(default_factory=list, max_length=128)
+    running_claims: List[RunningClaim] = Field(default_factory=list, max_length=128)
     routes: Optional[List[WorkerRoute]] = Field(default=None, max_length=128)
 
     def model_post_init(self, __context: Any) -> None:
@@ -93,6 +101,12 @@ class PlannerAgent(str, Enum):
     CODEX = "codex"
 
 
+class PlanningMode(str, Enum):
+    AUTO = "auto"
+    PLAN = "plan"
+    DIRECT = "direct"
+
+
 class TaskCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=100_000)
     target_worker_id: Optional[str] = Field(default=None, max_length=128)
@@ -104,6 +118,7 @@ class TaskCreate(BaseModel):
     telegram_chat_id: Optional[str] = Field(default=None, max_length=128)
     idempotency_key: Optional[str] = Field(default=None, max_length=256)
     planner_agent: Optional[PlannerAgent] = None
+    planning_mode: PlanningMode = PlanningMode.AUTO
     execution_agent: Optional[str] = Field(default=None, min_length=1, max_length=128)
     target_gateway_id: Optional[str] = Field(default=None, max_length=256)
     target_profile: Optional[str] = Field(default=None, max_length=256)
@@ -144,22 +159,75 @@ class TaskCreate(BaseModel):
             raise ValueError(
                 "target_gateway_id and target_profile must be provided together"
             )
+        if self.planning_mode == PlanningMode.DIRECT and self.planner_agent is not None:
+            raise ValueError("direct tasks cannot specify a planner agent")
 
 
 class TaskStatusUpdate(BaseModel):
     status: TaskStatus
+    claim_token: str = Field(min_length=32, max_length=128)
+
+
+class TaskProgressUpdate(BaseModel):
+    claim_token: str = Field(min_length=32, max_length=128)
+    phase: str = Field(min_length=1, max_length=128)
+    message: Optional[str] = Field(default=None, max_length=2000)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("details")
+    @classmethod
+    def limit_details(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 8192:
+            raise ValueError("progress details must not exceed 8192 bytes")
+
+        def depth(item: Any, level: int = 0) -> int:
+            if level > 6:
+                return level
+            if isinstance(item, dict):
+                return max(
+                    (depth(child, level + 1) for child in item.values()), default=level
+                )
+            if isinstance(item, list):
+                return max((depth(child, level + 1) for child in item), default=level)
+            return level
+
+        if depth(value) > 6:
+            raise ValueError("progress details must not exceed 6 nested levels")
+        return value
+
+
+class TaskReconcileRequest(BaseModel):
+    claim_token: str = Field(min_length=32, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+    deadline_exceeded: bool = False
+
+
+class TaskEventResponse(BaseModel):
+    id: int
+    task_id: str
+    event_type: str
+    phase: Optional[str] = None
+    status: Optional[TaskStatus] = None
+    worker_id: Optional[str] = None
+    message: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+    created_at: float
 
 
 class TaskRemoteRunUpdate(BaseModel):
+    claim_token: str = Field(min_length=32, max_length=128)
     remote_run_id: str = Field(min_length=1, max_length=256)
     remote_session_id: Optional[str] = Field(default=None, max_length=256)
 
 
 class TaskResult(BaseModel):
+    claim_token: str = Field(min_length=32, max_length=128)
     status: TaskStatus
     result: Optional[str] = Field(default=None, max_length=2_000_000)
     error: Optional[str] = Field(default=None, max_length=100_000)
     retryable: bool = False
+    remote_run_id: Optional[str] = Field(default=None, max_length=256)
 
 
 class TaskResponse(BaseModel):
@@ -168,6 +236,7 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     target_worker_id: Optional[str]
     claimed_by: Optional[str]
+    claim_token: Optional[str] = None
     workdir: Optional[str]
     timeout_seconds: int
     max_attempts: int
@@ -177,6 +246,7 @@ class TaskResponse(BaseModel):
     telegram_chat_id: Optional[str]
     idempotency_key: Optional[str] = None
     planner_agent: Optional[PlannerAgent] = None
+    planning_mode: PlanningMode = PlanningMode.AUTO
     execution_agent: Optional[str] = None
     target_gateway_id: Optional[str] = None
     target_profile: Optional[str] = None
@@ -187,6 +257,15 @@ class TaskResponse(BaseModel):
     resolved_execution_agent: Optional[str] = None
     remote_run_id: Optional[str] = None
     remote_session_id: Optional[str] = None
+    remote_run_attempt: Optional[int] = None
+    current_phase: Optional[str] = None
+    last_progress_at: Optional[float] = None
+    reconciliation_reason: Optional[str] = None
+    reconciliation_started_at: Optional[float] = None
+    reconciliation_deadline_at: Optional[float] = None
+    reconciliation_next_attempt_at: Optional[float] = None
+    deadline_exceeded_at: Optional[float] = None
+    cancel_requested_at: Optional[float] = None
     routing_diagnostic: Optional[str] = None
     plan: Optional[str] = None
     execution_prompt: Optional[str] = None
@@ -202,6 +281,7 @@ class TaskResponse(BaseModel):
     started_at: Optional[float]
     finished_at: Optional[float]
     lease_expires_at: Optional[float]
+    recent_events: List[TaskEventResponse] = Field(default_factory=list)
 
 
 class WorkerResponse(BaseModel):

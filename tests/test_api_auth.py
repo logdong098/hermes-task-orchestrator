@@ -42,6 +42,37 @@ class CoordinatorAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(201, response.status_code)
         self.assertEqual("planning_pending", response.json()["status"])
+        self.assertEqual("plan", response.json()["planning_mode"])
+
+        direct = await self.client.post(
+            "/api/v1/tasks",
+            json={"prompt": "quick fix", "planning_mode": "direct"},
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(201, direct.status_code)
+        self.assertEqual("pending", direct.json()["status"])
+        self.assertEqual("direct", direct.json()["planning_mode"])
+        self.assertIsNone(direct.json()["planner_agent"])
+
+        fetched = await self.client.get(
+            f"/api/v1/tasks/{direct.json()['id']}",
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(200, fetched.status_code)
+        self.assertEqual(
+            "task_created", fetched.json()["recent_events"][0]["event_type"]
+        )
+
+        contradictory = await self.client.post(
+            "/api/v1/tasks",
+            json={
+                "prompt": "invalid",
+                "planning_mode": "direct",
+                "planner_agent": "codex",
+            },
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(422, contradictory.status_code)
 
     async def test_worker_hmac_authentication(self) -> None:
         path = "/api/v1/workers/register"

@@ -21,12 +21,19 @@ class NotFoundError(RuntimeError):
 class SQLiteStore:
     """SQLite-backed repository; API code only depends on these repository methods."""
 
-    def __init__(self, database_path: str) -> None:
+    def __init__(
+        self,
+        database_path: str,
+        reconciliation_grace_seconds: int = 3600,
+        reconciliation_backoff_seconds: int = 5,
+    ) -> None:
         if database_path == ":memory:":
             raise ValueError(
                 "SQLiteStore does not support :memory: because operations use short connections"
             )
         self.database_path = database_path
+        self.reconciliation_grace_seconds = reconciliation_grace_seconds
+        self.reconciliation_backoff_seconds = reconciliation_backoff_seconds
 
     def initialize(self) -> None:
         if self.database_path != ":memory:":
@@ -67,6 +74,7 @@ class SQLiteStore:
                     status TEXT NOT NULL,
                     target_worker_id TEXT,
                     claimed_by TEXT,
+                    claim_token TEXT,
                     workdir TEXT,
                     timeout_seconds INTEGER NOT NULL,
                     max_attempts INTEGER NOT NULL,
@@ -76,6 +84,7 @@ class SQLiteStore:
                     telegram_chat_id TEXT,
                     idempotency_key TEXT,
                     planner_agent TEXT,
+                    planning_mode TEXT NOT NULL DEFAULT 'auto',
                     execution_agent TEXT,
                     plan TEXT,
                     execution_prompt TEXT,
@@ -91,6 +100,15 @@ class SQLiteStore:
                     started_at REAL,
                     finished_at REAL,
                     lease_expires_at REAL,
+                    current_phase TEXT,
+                    last_progress_at REAL,
+                    reconciliation_reason TEXT,
+                    reconciliation_started_at REAL,
+                    reconciliation_deadline_at REAL,
+                    reconciliation_next_attempt_at REAL,
+                    deadline_exceeded_at REAL,
+                    cancel_requested_at REAL,
+                    remote_run_attempt INTEGER,
                     FOREIGN KEY (claimed_by) REFERENCES workers(worker_id)
                 );
 
@@ -110,6 +128,21 @@ class SQLiteStore:
                     UNIQUE(task_id, channel),
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    phase TEXT,
+                    status TEXT,
+                    worker_id TEXT,
+                    message TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_events_task
+                    ON task_events(task_id, id);
 
                 CREATE TABLE IF NOT EXISTS worker_nonces (
                     worker_id TEXT NOT NULL,
@@ -158,6 +191,7 @@ class SQLiteStore:
                 connection.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
             additive_task_columns = {
                 "planner_agent": "TEXT",
+                "planning_mode": "TEXT NOT NULL DEFAULT 'auto'",
                 "execution_agent": "TEXT",
                 "plan": "TEXT",
                 "execution_prompt": "TEXT",
@@ -166,12 +200,40 @@ class SQLiteStore:
                 "planner_started_at": "REAL",
                 "planner_finished_at": "REAL",
                 "planner_lease_expires_at": "REAL",
+                "current_phase": "TEXT",
+                "last_progress_at": "REAL",
+                "reconciliation_reason": "TEXT",
+                "reconciliation_started_at": "REAL",
+                "reconciliation_deadline_at": "REAL",
+                "reconciliation_next_attempt_at": "REAL",
+                "deadline_exceeded_at": "REAL",
+                "cancel_requested_at": "REAL",
+                "remote_run_attempt": "INTEGER",
+                "claim_token": "TEXT",
             }
             for column, definition in additive_task_columns.items():
                 if column not in task_columns:
                     connection.execute(
                         f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
                     )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET planning_mode = CASE
+                    WHEN planner_agent IS NOT NULL THEN 'plan'
+                    ELSE 'direct'
+                END
+                WHERE planning_mode IS NULL OR planning_mode = 'auto'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET remote_run_attempt = attempt_count
+                WHERE remote_run_id IS NOT NULL
+                  AND remote_run_attempt IS NULL
+                """
+            )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_key
@@ -234,6 +296,53 @@ class SQLiteStore:
     @staticmethod
     def _task(row: sqlite3.Row) -> Dict[str, Any]:
         return dict(row)
+
+    @staticmethod
+    def _require_claim(
+        row: sqlite3.Row, worker_id: str, claim_token: Optional[str]
+    ) -> None:
+        if row["claimed_by"] != worker_id:
+            raise ConflictError("task belongs to another worker")
+        if not claim_token or row["claim_token"] != claim_token:
+            raise ConflictError("task claim is stale")
+
+    @staticmethod
+    def _event(row: sqlite3.Row) -> Dict[str, Any]:
+        event = dict(row)
+        event["details"] = json.loads(event.pop("details_json"))
+        return event
+
+    def _append_event(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        event_type: str,
+        now: float,
+        *,
+        phase: Optional[str] = None,
+        status: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO task_events (
+                task_id, event_type, phase, status, worker_id, message,
+                details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                event_type,
+                phase,
+                status,
+                worker_id,
+                message,
+                self._json(details or {}),
+                now,
+            ),
+        )
 
     @staticmethod
     def _worker(row: sqlite3.Row, stale_seconds: int, now: float) -> Dict[str, Any]:
@@ -334,7 +443,17 @@ class SQLiteStore:
                     """INSERT INTO worker_routes
                     (route_id, worker_id, gateway_id, profile, target_profile,
                      gateway_kind, supported_agents_json, default_agent, labels_json, last_seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(route_id) DO UPDATE SET
+                        worker_id = excluded.worker_id,
+                        gateway_id = excluded.gateway_id,
+                        profile = excluded.profile,
+                        target_profile = excluded.target_profile,
+                        gateway_kind = excluded.gateway_kind,
+                        supported_agents_json = excluded.supported_agents_json,
+                        default_agent = excluded.default_agent,
+                        labels_json = excluded.labels_json,
+                        last_seen_at = excluded.last_seen_at""",
                     (
                         route["route_id"],
                         worker["worker_id"],
@@ -390,6 +509,7 @@ class SQLiteStore:
         running_task_ids: List[str],
         lease_seconds: int,
         routes: Optional[List[Dict[str, Any]]] = None,
+        running_claims: Optional[List[Dict[str, str]]] = None,
         now: Optional[float] = None,
     ) -> List[str]:
         current = now if now is not None else time.time()
@@ -415,7 +535,17 @@ class SQLiteStore:
                         """INSERT INTO worker_routes
                         (route_id, worker_id, gateway_id, profile, target_profile, gateway_kind,
                          supported_agents_json, default_agent, labels_json, last_seen_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(route_id) DO UPDATE SET
+                            worker_id = excluded.worker_id,
+                            gateway_id = excluded.gateway_id,
+                            profile = excluded.profile,
+                            target_profile = excluded.target_profile,
+                            gateway_kind = excluded.gateway_kind,
+                            supported_agents_json = excluded.supported_agents_json,
+                            default_agent = excluded.default_agent,
+                            labels_json = excluded.labels_json,
+                            last_seen_at = excluded.last_seen_at""",
                         (
                             route["route_id"],
                             worker_id,
@@ -441,6 +571,7 @@ class SQLiteStore:
                     UPDATE tasks SET lease_expires_at = ?, updated_at = ?
                     WHERE claimed_by = ?
                       AND id IN ({placeholders})
+                      AND claim_token IS NULL
                       AND status IN (?, ?)
                     """,
                     (
@@ -448,6 +579,23 @@ class SQLiteStore:
                         current,
                         worker_id,
                         *running_task_ids,
+                        TaskStatus.CLAIMED.value,
+                        TaskStatus.RUNNING.value,
+                    ),
+                )
+            for claim in running_claims or []:
+                connection.execute(
+                    """
+                    UPDATE tasks SET lease_expires_at = ?, updated_at = ?
+                    WHERE claimed_by = ? AND id = ? AND claim_token = ?
+                      AND status IN (?, ?)
+                    """,
+                    (
+                        current + lease_seconds,
+                        current,
+                        worker_id,
+                        claim["task_id"],
+                        claim["claim_token"],
                         TaskStatus.CLAIMED.value,
                         TaskStatus.RUNNING.value,
                     ),
@@ -522,14 +670,19 @@ class SQLiteStore:
         )
         task_id = str(uuid.uuid4())
         planner_agent = task.get("planner_agent")
+        planning_mode = task.get("planning_mode", "auto")
+        if planning_mode == "auto":
+            planning_mode = "plan" if planner_agent else "direct"
+        initial_status = (
+            TaskStatus.PLANNING_PENDING.value
+            if planning_mode == "plan"
+            else TaskStatus.PENDING.value
+        )
+        initial_phase = "planning" if planning_mode == "plan" else "queued"
         values = (
             task_id,
             task["prompt"],
-            (
-                TaskStatus.PLANNING_PENDING.value
-                if planner_agent
-                else TaskStatus.PENDING.value
-            ),
+            initial_status,
             task.get("target_worker_id"),
             task.get("target_gateway_id"),
             task.get("target_profile"),
@@ -541,8 +694,11 @@ class SQLiteStore:
             task.get("telegram_chat_id"),
             task.get("idempotency_key"),
             planner_agent,
+            planning_mode,
             task.get("execution_agent"),
             default_planner_max_attempts,
+            initial_phase,
+            current,
             current,
             current,
         )
@@ -555,8 +711,9 @@ class SQLiteStore:
                         target_profile, workdir,
                         timeout_seconds, max_attempts, priority, creator_user_id,
                         telegram_chat_id, idempotency_key, planner_agent,
-                        execution_agent, planner_max_attempts, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        planning_mode, execution_agent, planner_max_attempts,
+                        current_phase, last_progress_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     values,
                 )
@@ -571,6 +728,20 @@ class SQLiteStore:
                 if existing is None:
                     raise
                 return self._task(existing)
+            self._append_event(
+                connection,
+                task_id,
+                "task_created",
+                current,
+                phase=initial_phase,
+                status=initial_status,
+                message=(
+                    "task queued for planning"
+                    if planning_mode == "plan"
+                    else "direct task queued for execution"
+                ),
+                details={"planning_mode": planning_mode},
+            )
             row = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -591,6 +762,22 @@ class SQLiteStore:
                 "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self._task(row) for row in rows]
+
+    def list_task_events(self, task_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if exists is None:
+                raise NotFoundError("task not found")
+            rows = connection.execute(
+                """
+                SELECT * FROM task_events
+                WHERE task_id = ? ORDER BY id DESC LIMIT ?
+                """,
+                (task_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return [self._event(row) for row in reversed(rows)]
 
     def claim_task(
         self,
@@ -627,12 +814,31 @@ class SQLiteStore:
             rows = connection.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status = ?
-                  AND (target_worker_id IS NULL OR target_worker_id = ?)
-                  AND (target_gateway_id IS NOT NULL OR ? = 'command')
+                WHERE (
+                    status = ?
+                    AND (target_worker_id IS NULL OR target_worker_id = ?)
+                    AND (target_gateway_id IS NOT NULL OR ? = 'command')
+                ) OR (
+                    status = ?
+                    AND remote_run_id IS NOT NULL
+                    AND resolved_worker_id = ?
+                    AND ? = 'gateway'
+                    AND (
+                        reconciliation_next_attempt_at IS NULL
+                        OR reconciliation_next_attempt_at <= ?
+                    )
+                )
                 ORDER BY priority DESC, created_at ASC
                 """,
-                (TaskStatus.PENDING.value, worker_id, worker["worker_kind"]),
+                (
+                    TaskStatus.PENDING.value,
+                    worker_id,
+                    worker["worker_kind"],
+                    TaskStatus.RECONCILING.value,
+                    worker_id,
+                    worker["worker_kind"],
+                    current,
+                ),
             ).fetchall()
             capabilities = set(json.loads(worker["capabilities_json"]))
             route_rows = connection.execute(
@@ -643,10 +849,15 @@ class SQLiteStore:
                 (r["gateway_id"], r["target_profile"] or r["profile"]): r
                 for r in route_rows
             }
+            route_by_id = {r["route_id"]: r for r in route_rows}
             selected = None
             for candidate in rows:
                 route = None
-                if candidate["target_gateway_id"] is not None:
+                if candidate["status"] == TaskStatus.RECONCILING.value:
+                    route = route_by_id.get(candidate["resolved_route_id"])
+                    if route is None:
+                        continue
+                elif candidate["target_gateway_id"] is not None:
                     route = route_by_key.get(
                         (candidate["target_gateway_id"], candidate["target_profile"])
                     )
@@ -669,33 +880,83 @@ class SQLiteStore:
             if row is None:
                 connection.commit()
                 return None
-            cursor = connection.execute(
-                """
-                UPDATE tasks
-                SET status = ?, claimed_by = ?, attempt_count = attempt_count + 1,
-                    lease_expires_at = ?, updated_at = ?, resolved_worker_id = ?,
-                    resolved_route_id = ?, resolved_gateway_id = ?, resolved_profile = ?,
-                    resolved_execution_agent = ?
-                WHERE id = ? AND status = ?
-                """,
-                (
-                    TaskStatus.CLAIMED.value,
-                    worker_id,
-                    current + lease_seconds,
-                    current,
-                    worker_id,
-                    route["route_id"] if route else f"{worker_id}:command",
-                    route["gateway_id"] if route else None,
-                    route["profile"] if route else None,
-                    row["execution_agent"]
-                    or (route["default_agent"] if route else worker["default_agent"]),
-                    row["id"],
-                    TaskStatus.PENDING.value,
-                ),
-            )
+            claim_token = uuid.uuid4().hex
+            if row["status"] == TaskStatus.RECONCILING.value:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks SET status = ?, claimed_by = ?, claim_token = ?,
+                        lease_expires_at = ?,
+                        updated_at = ?, current_phase = ?, last_progress_at = ?,
+                        reconciliation_next_attempt_at = NULL
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        TaskStatus.CLAIMED.value,
+                        worker_id,
+                        claim_token,
+                        current + lease_seconds,
+                        current,
+                        "reconciling",
+                        current,
+                        row["id"],
+                        TaskStatus.RECONCILING.value,
+                    ),
+                )
+                event_type = "reconciliation_claimed"
+                phase = "reconciling"
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, claimed_by = ?, claim_token = ?,
+                        attempt_count = attempt_count + 1,
+                        lease_expires_at = ?, updated_at = ?, resolved_worker_id = ?,
+                        resolved_route_id = ?, resolved_gateway_id = ?, resolved_profile = ?,
+                        resolved_execution_agent = ?, current_phase = ?,
+                        last_progress_at = ?, reconciliation_reason = NULL,
+                        reconciliation_started_at = NULL,
+                        reconciliation_deadline_at = NULL,
+                        reconciliation_next_attempt_at = NULL,
+                        deadline_exceeded_at = NULL
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        TaskStatus.CLAIMED.value,
+                        worker_id,
+                        claim_token,
+                        current + lease_seconds,
+                        current,
+                        worker_id,
+                        route["route_id"] if route else f"{worker_id}:command",
+                        route["gateway_id"] if route else None,
+                        route["profile"] if route else None,
+                        row["execution_agent"]
+                        or (
+                            route["default_agent"] if route else worker["default_agent"]
+                        ),
+                        "claimed",
+                        current,
+                        row["id"],
+                        TaskStatus.PENDING.value,
+                    ),
+                )
+                event_type = "task_claimed"
+                phase = "claimed"
             if cursor.rowcount != 1:
                 connection.rollback()
                 return None
+            self._append_event(
+                connection,
+                row["id"],
+                event_type,
+                current,
+                phase=phase,
+                status=TaskStatus.CLAIMED.value,
+                worker_id=worker_id,
+                details={
+                    "route_id": route["route_id"] if route else f"{worker_id}:command"
+                },
+            )
             claimed = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -708,6 +969,7 @@ class SQLiteStore:
         worker_id: str,
         remote_run_id: str,
         remote_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         current = now if now is not None else time.time()
@@ -726,24 +988,59 @@ class SQLiteStore:
             ):
                 connection.commit()
                 raise ConflictError("remote run can only be attached to an active task")
-            if row["claimed_by"] != worker_id:
-                connection.rollback()
-                raise ConflictError("task belongs to another worker")
+            try:
+                self._require_claim(row, worker_id, claim_token)
+            except ConflictError:
+                connection.commit()
+                raise
             if row["lease_expires_at"] is None or row["lease_expires_at"] <= current:
                 connection.rollback()
                 raise ConflictError("task lease expired before remote run attachment")
+            if (
+                row["remote_run_id"]
+                and row["remote_run_id"] != remote_run_id
+                and row["remote_run_attempt"] == row["attempt_count"]
+                and not row["reconciliation_reason"]
+            ):
+                connection.rollback()
+                raise ConflictError(
+                    "task attempt is already bound to another remote run"
+                )
             connection.execute(
-                """UPDATE tasks SET remote_run_id = ?, remote_session_id = ?, updated_at = ?
+                """UPDATE tasks SET remote_run_id = ?, remote_session_id = ?,
+                    remote_run_attempt = ?, updated_at = ?, current_phase = ?,
+                    last_progress_at = ?, reconciliation_reason = NULL,
+                    reconciliation_started_at = NULL,
+                    reconciliation_deadline_at = NULL,
+                    reconciliation_next_attempt_at = NULL
                 WHERE id = ? AND claimed_by = ? AND status IN (?, ?)""",
                 (
                     remote_run_id,
                     remote_session_id,
+                    row["attempt_count"],
+                    current,
+                    "remote_running",
                     current,
                     task_id,
                     worker_id,
                     TaskStatus.CLAIMED.value,
                     TaskStatus.RUNNING.value,
                 ),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "remote_run_attached",
+                current,
+                phase="remote_running",
+                status=row["status"],
+                worker_id=worker_id,
+                message=f"remote run {remote_run_id} attached",
+                details={
+                    "remote_run_id": remote_run_id,
+                    "remote_session_id": remote_session_id,
+                    "attempt": row["attempt_count"],
+                },
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -800,6 +1097,21 @@ class SQLiteStore:
             if cursor.rowcount != 1:
                 connection.rollback()
                 return None
+            connection.execute(
+                """
+                UPDATE tasks SET current_phase = ?, last_progress_at = ? WHERE id = ?
+                """,
+                ("planning", current, row["id"]),
+            )
+            self._append_event(
+                connection,
+                row["id"],
+                "planning_started",
+                current,
+                phase="planning",
+                status=TaskStatus.PLANNING.value,
+                details={"attempt": row["planner_attempt_count"] + 1},
+            )
             claimed = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -870,7 +1182,8 @@ class SQLiteStore:
                 """
                 UPDATE tasks SET status = ?, plan = ?, execution_prompt = ?,
                     planner_finished_at = ?, planner_lease_expires_at = NULL,
-                    error = NULL, updated_at = ?
+                    error = NULL, updated_at = ?, current_phase = ?,
+                    last_progress_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -879,8 +1192,19 @@ class SQLiteStore:
                     execution_prompt,
                     current,
                     current,
+                    "queued",
+                    current,
                     task_id,
                 ),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "planning_completed",
+                current,
+                phase="queued",
+                status=TaskStatus.PENDING.value,
+                message="plan ready; task queued for execution",
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -925,18 +1249,54 @@ class SQLiteStore:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
-                        error = ?, updated_at = ? WHERE id = ?
+                        error = ?, updated_at = ?, current_phase = ?,
+                        last_progress_at = ? WHERE id = ?
                     """,
-                    (TaskStatus.PLANNING_PENDING.value, error, current, task_id),
+                    (
+                        TaskStatus.PLANNING_PENDING.value,
+                        error,
+                        current,
+                        "planning",
+                        current,
+                        task_id,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id,
+                    "planning_requeued",
+                    current,
+                    phase="planning",
+                    status=TaskStatus.PLANNING_PENDING.value,
+                    message=error,
                 )
             else:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_finished_at = ?,
                         planner_lease_expires_at = NULL, finished_at = ?,
-                        error = ?, updated_at = ? WHERE id = ?
+                        error = ?, updated_at = ?, current_phase = ?,
+                        last_progress_at = ? WHERE id = ?
                     """,
-                    (status, current, current, error, current, task_id),
+                    (
+                        status,
+                        current,
+                        current,
+                        error,
+                        current,
+                        status,
+                        current,
+                        task_id,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id,
+                    "planning_failed",
+                    current,
+                    phase=status,
+                    status=status,
+                    message=error,
                 )
                 final_row = connection.execute(
                     "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -953,6 +1313,7 @@ class SQLiteStore:
         task_id: str,
         worker_id: str,
         status: str,
+        claim_token: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         current = now if now is not None else time.time()
@@ -965,21 +1326,181 @@ class SQLiteStore:
             if row is None:
                 connection.rollback()
                 raise NotFoundError("task not found")
-            if row["claimed_by"] != worker_id:
-                connection.rollback()
-                raise ConflictError("task belongs to another worker")
+            try:
+                self._require_claim(row, worker_id, claim_token)
+            except ConflictError:
+                connection.commit()
+                raise
             if (
                 status != TaskStatus.RUNNING.value
                 or row["status"] != TaskStatus.CLAIMED.value
             ):
                 connection.rollback()
                 raise ConflictError(f"invalid transition: {row['status']} -> {status}")
+            phase = "reconciling" if row["reconciliation_reason"] else "running"
             connection.execute(
                 """
-                UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+                UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?),
+                    updated_at = ?, current_phase = ?, last_progress_at = ?
                 WHERE id = ?
                 """,
-                (status, current, current, task_id),
+                (status, current, current, phase, current, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "task_running",
+                current,
+                phase=phase,
+                status=status,
+                worker_id=worker_id,
+            )
+            updated = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return self._task(updated)
+
+    def record_progress(
+        self,
+        task_id: str,
+        worker_id: str,
+        phase: str,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        claim_token: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        current = now if now is not None else time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._maintenance(connection, current)
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFoundError("task not found")
+            try:
+                self._require_claim(row, worker_id, claim_token)
+            except ConflictError:
+                connection.commit()
+                raise
+            if row["status"] not in (
+                TaskStatus.CLAIMED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.CANCEL_REQUESTED.value,
+            ):
+                connection.rollback()
+                raise ConflictError("progress can only be reported for an active task")
+            connection.execute(
+                """
+                UPDATE tasks SET current_phase = ?, last_progress_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (phase, current, current, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "worker_progress",
+                current,
+                phase=phase,
+                status=row["status"],
+                worker_id=worker_id,
+                message=message,
+                details=details,
+            )
+            updated = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return self._task(updated)
+
+    def mark_reconciling(
+        self,
+        task_id: str,
+        worker_id: str,
+        reason: str,
+        deadline_exceeded: bool = False,
+        claim_token: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        current = now if now is not None else time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._maintenance(connection, current)
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFoundError("task not found")
+            try:
+                self._require_claim(row, worker_id, claim_token)
+            except ConflictError:
+                connection.commit()
+                raise
+            if row["status"] not in (
+                TaskStatus.CLAIMED.value,
+                TaskStatus.RUNNING.value,
+            ):
+                connection.rollback()
+                raise ConflictError("only an active task can enter reconciliation")
+            if not row["remote_run_id"]:
+                connection.rollback()
+                raise ConflictError("reconciliation requires a remote run")
+            if row["remote_run_attempt"] != row["attempt_count"]:
+                connection.rollback()
+                raise ConflictError("remote run belongs to an older task attempt")
+            if deadline_exceeded and (
+                row["started_at"] is None
+                or row["started_at"] + row["timeout_seconds"] > current
+            ):
+                connection.rollback()
+                raise ConflictError("task execution deadline has not been reached")
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, lease_expires_at = NULL,
+                    claim_token = NULL,
+                    current_phase = ?, last_progress_at = ?, updated_at = ?,
+                    reconciliation_reason = ?,
+                    reconciliation_started_at = COALESCE(reconciliation_started_at, ?),
+                    reconciliation_deadline_at = COALESCE(reconciliation_deadline_at, ?),
+                    reconciliation_next_attempt_at = ?,
+                    deadline_exceeded_at = CASE
+                        WHEN ? THEN COALESCE(deadline_exceeded_at, ?)
+                        ELSE deadline_exceeded_at
+                    END
+                WHERE id = ?
+                """,
+                (
+                    TaskStatus.RECONCILING.value,
+                    "reconciling",
+                    current,
+                    current,
+                    reason,
+                    current,
+                    current + self.reconciliation_grace_seconds,
+                    current + self.reconciliation_backoff_seconds,
+                    1 if deadline_exceeded else 0,
+                    current,
+                    task_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "reconciliation_started",
+                current,
+                phase="reconciling",
+                status=TaskStatus.RECONCILING.value,
+                worker_id=worker_id,
+                message=reason,
+                details={
+                    "remote_run_id": row["remote_run_id"],
+                    "deadline_exceeded": deadline_exceeded,
+                },
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -995,6 +1516,8 @@ class SQLiteStore:
         result: Optional[str],
         error: Optional[str],
         retryable: bool,
+        remote_run_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         current = now if now is not None else time.time()
@@ -1015,9 +1538,21 @@ class SQLiteStore:
             if row is None:
                 connection.rollback()
                 raise NotFoundError("task not found")
-            if row["claimed_by"] != worker_id:
+            try:
+                self._require_claim(row, worker_id, claim_token)
+            except ConflictError:
+                connection.commit()
+                raise
+            if row["remote_run_id"]:
+                if remote_run_id != row["remote_run_id"]:
+                    connection.rollback()
+                    raise ConflictError("result does not match the active remote run")
+                if row["remote_run_attempt"] != row["attempt_count"]:
+                    connection.rollback()
+                    raise ConflictError("result belongs to an older task attempt")
+            elif remote_run_id is not None:
                 connection.rollback()
-                raise ConflictError("task belongs to another worker")
+                raise ConflictError("command task cannot report a remote run")
             if row["status"] in TERMINAL_STATUSES:
                 connection.commit()
                 return self._task(row)
@@ -1027,7 +1562,10 @@ class SQLiteStore:
                     raise ConflictError(
                         f"invalid transition: {row['status']} -> {status}"
                     )
-            elif row["status"] != TaskStatus.RUNNING.value:
+            elif row["status"] not in (
+                TaskStatus.RUNNING.value,
+                TaskStatus.RECONCILING.value,
+            ):
                 connection.rollback()
                 raise ConflictError(f"invalid transition: {row['status']} -> {status}")
             if row["status"] == TaskStatus.CANCEL_REQUESTED.value:
@@ -1040,22 +1578,74 @@ class SQLiteStore:
             ):
                 connection.execute(
                     """
-                    UPDATE tasks SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                        updated_at = ?, error = ?, resolved_worker_id = NULL,
+                    UPDATE tasks SET status = ?, claimed_by = NULL, claim_token = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?, error = ?, current_phase = ?,
+                        last_progress_at = ?, resolved_worker_id = NULL,
                         resolved_route_id = NULL, resolved_gateway_id = NULL,
-                        resolved_profile = NULL, resolved_execution_agent = NULL
+                        resolved_profile = NULL, resolved_execution_agent = NULL,
+                        remote_run_id = NULL, remote_session_id = NULL,
+                        remote_run_attempt = NULL, reconciliation_reason = NULL,
+                        reconciliation_started_at = NULL,
+                        reconciliation_deadline_at = NULL,
+                        reconciliation_next_attempt_at = NULL,
+                        deadline_exceeded_at = NULL
                     WHERE id = ?
                     """,
-                    (TaskStatus.PENDING.value, current, error, task_id),
+                    (
+                        TaskStatus.PENDING.value,
+                        current,
+                        error,
+                        "queued",
+                        current,
+                        task_id,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id,
+                    "task_requeued",
+                    current,
+                    phase="queued",
+                    status=TaskStatus.PENDING.value,
+                    worker_id=worker_id,
+                    message=error,
+                    details={"attempt": row["attempt_count"]},
                 )
             else:
+                phase = "completed" if status == TaskStatus.SUCCEEDED.value else status
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, result = ?, error = ?, finished_at = ?,
-                        lease_expires_at = NULL, updated_at = ?
+                        claim_token = NULL,
+                        lease_expires_at = NULL, updated_at = ?, current_phase = ?,
+                        last_progress_at = ?, reconciliation_next_attempt_at = NULL
                     WHERE id = ?
                     """,
-                    (status, result, error, current, current, task_id),
+                    (
+                        status,
+                        result,
+                        error,
+                        current,
+                        current,
+                        phase,
+                        current,
+                        task_id,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id,
+                    "task_finished",
+                    current,
+                    phase=phase,
+                    status=status,
+                    worker_id=worker_id,
+                    message=error or "task completed",
+                    details={
+                        "attempt": row["attempt_count"],
+                        "remote_run_id": remote_run_id,
+                    },
                 )
                 final_row = connection.execute(
                     "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -1087,15 +1677,44 @@ class SQLiteStore:
             ):
                 next_status = TaskStatus.CANCELLED.value
                 finished_at = current
+                phase = "cancelled"
+                next_reconciliation_attempt = row["reconciliation_next_attempt_at"]
+            elif row["status"] == TaskStatus.RECONCILING.value:
+                next_status = TaskStatus.RECONCILING.value
+                finished_at = None
+                phase = "reconciling"
+                next_reconciliation_attempt = current
             else:
                 next_status = TaskStatus.CANCEL_REQUESTED.value
                 finished_at = None
+                phase = "cancelling"
+                next_reconciliation_attempt = row["reconciliation_next_attempt_at"]
             connection.execute(
                 """
-                UPDATE tasks SET status = ?, updated_at = ?, finished_at = ?
+                UPDATE tasks SET status = ?, updated_at = ?, finished_at = ?,
+                    current_phase = ?, last_progress_at = ?, cancel_requested_at = ?,
+                    reconciliation_next_attempt_at = ?
                 WHERE id = ?
                 """,
-                (next_status, current, finished_at, task_id),
+                (
+                    next_status,
+                    current,
+                    finished_at,
+                    phase,
+                    current,
+                    current,
+                    next_reconciliation_attempt,
+                    task_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id,
+                "task_cancel_requested",
+                current,
+                phase=phase,
+                status=next_status,
+                worker_id=row["claimed_by"],
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -1163,21 +1782,34 @@ class SQLiteStore:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
-                        updated_at = ?, error = ? WHERE id = ?
+                        updated_at = ?, error = ?, current_phase = ?,
+                        last_progress_at = ? WHERE id = ?
                     """,
                     (
                         TaskStatus.PLANNING_PENDING.value,
                         now,
                         "planner lease expired; task requeued",
+                        "planning",
+                        now,
                         row["id"],
                     ),
+                )
+                self._append_event(
+                    connection,
+                    row["id"],
+                    "planning_requeued",
+                    now,
+                    phase="planning",
+                    status=TaskStatus.PLANNING_PENDING.value,
+                    message="planner lease expired; task requeued",
                 )
                 continue
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
                     planner_finished_at = ?, finished_at = ?, updated_at = ?,
-                    error = COALESCE(error, ?) WHERE id = ?
+                    error = COALESCE(error, ?), current_phase = ?,
+                    last_progress_at = ? WHERE id = ?
                 """,
                 (
                     TaskStatus.TIMED_OUT.value,
@@ -1185,8 +1817,19 @@ class SQLiteStore:
                     now,
                     now,
                     "planner lease expired",
+                    "timed_out",
+                    now,
                     row["id"],
                 ),
+            )
+            self._append_event(
+                connection,
+                row["id"],
+                "planning_timed_out",
+                now,
+                phase="timed_out",
+                status=TaskStatus.TIMED_OUT.value,
+                message="planner lease expired",
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)
@@ -1210,38 +1853,189 @@ class SQLiteStore:
             ),
         ).fetchall()
         for row in rows:
-            if row["status"] == TaskStatus.CANCEL_REQUESTED.value:
-                next_status = TaskStatus.CANCELLED.value
-            elif (
+            current_remote_run = (
+                row["remote_run_id"]
+                and row["remote_run_attempt"] == row["attempt_count"]
+            )
+            execution_deadline_exceeded = (
                 row["started_at"] is not None
                 and row["started_at"] + row["timeout_seconds"] < now
-            ):
+            )
+            if current_remote_run:
+                reason = (
+                    "cancellation pending while remote run is unreachable"
+                    if row["status"] == TaskStatus.CANCEL_REQUESTED.value
+                    else (
+                        "execution deadline exceeded; remote outcome needs reconciliation"
+                        if execution_deadline_exceeded
+                        else "worker lease expired; remote outcome needs reconciliation"
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks SET status = ?, lease_expires_at = NULL,
+                        claim_token = NULL,
+                        updated_at = ?, error = ?, current_phase = ?,
+                        last_progress_at = ?, reconciliation_reason = ?,
+                        reconciliation_started_at = COALESCE(reconciliation_started_at, ?),
+                        reconciliation_deadline_at = COALESCE(reconciliation_deadline_at, ?),
+                        reconciliation_next_attempt_at = ?,
+                        deadline_exceeded_at = CASE
+                            WHEN ? THEN COALESCE(deadline_exceeded_at, ?)
+                            ELSE deadline_exceeded_at
+                        END
+                    WHERE id = ?
+                    """,
+                    (
+                        TaskStatus.RECONCILING.value,
+                        now,
+                        reason,
+                        "reconciling",
+                        now,
+                        reason,
+                        now,
+                        now + self.reconciliation_grace_seconds,
+                        now,
+                        1 if execution_deadline_exceeded else 0,
+                        now,
+                        row["id"],
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    row["id"],
+                    "reconciliation_started",
+                    now,
+                    phase="reconciling",
+                    status=TaskStatus.RECONCILING.value,
+                    worker_id=row["claimed_by"],
+                    message=reason,
+                    details={
+                        "remote_run_id": row["remote_run_id"],
+                        "deadline_exceeded": execution_deadline_exceeded,
+                    },
+                )
+                continue
+            if row["status"] == TaskStatus.CANCEL_REQUESTED.value:
+                next_status = TaskStatus.CANCELLED.value
+            elif execution_deadline_exceeded:
                 next_status = TaskStatus.TIMED_OUT.value
             elif row["attempt_count"] < row["max_attempts"]:
                 connection.execute(
                     """
-                    UPDATE tasks SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                        updated_at = ?, error = ?, resolved_worker_id = NULL,
+                    UPDATE tasks SET status = ?, claimed_by = NULL, claim_token = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?, error = ?, current_phase = ?,
+                        last_progress_at = ?, resolved_worker_id = NULL,
                         resolved_route_id = NULL, resolved_gateway_id = NULL,
-                        resolved_profile = NULL, resolved_execution_agent = NULL WHERE id = ?
+                        resolved_profile = NULL, resolved_execution_agent = NULL,
+                        remote_run_id = NULL, remote_session_id = NULL,
+                        remote_run_attempt = NULL, reconciliation_reason = NULL,
+                        reconciliation_started_at = NULL,
+                        reconciliation_deadline_at = NULL,
+                        reconciliation_next_attempt_at = NULL,
+                        deadline_exceeded_at = NULL WHERE id = ?
                     """,
                     (
                         TaskStatus.PENDING.value,
                         now,
                         "worker lease expired; task requeued",
+                        "queued",
+                        now,
                         row["id"],
                     ),
+                )
+                self._append_event(
+                    connection,
+                    row["id"],
+                    "task_requeued",
+                    now,
+                    phase="queued",
+                    status=TaskStatus.PENDING.value,
+                    worker_id=row["claimed_by"],
+                    message="worker lease expired; task requeued",
                 )
                 continue
             else:
                 next_status = TaskStatus.TIMED_OUT.value
             connection.execute(
                 """
-                UPDATE tasks SET status = ?, lease_expires_at = NULL, updated_at = ?,
-                    finished_at = ?, error = COALESCE(error, ?)
+                UPDATE tasks SET status = ?, lease_expires_at = NULL,
+                    claim_token = NULL, updated_at = ?,
+                    finished_at = ?, error = COALESCE(error, ?), current_phase = ?,
+                    last_progress_at = ?
                 WHERE id = ?
                 """,
-                (next_status, now, now, "task lease or execution timeout", row["id"]),
+                (
+                    next_status,
+                    now,
+                    now,
+                    "task lease or execution timeout",
+                    next_status,
+                    now,
+                    row["id"],
+                ),
+            )
+            self._append_event(
+                connection,
+                row["id"],
+                "task_finished",
+                now,
+                phase=next_status,
+                status=next_status,
+                worker_id=row["claimed_by"],
+                message="task lease or execution timeout",
+            )
+            updated = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (row["id"],)
+            ).fetchone()
+            self._enqueue_notification(connection, updated, now)
+
+        reconciliation_rows = connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = ? AND reconciliation_deadline_at IS NOT NULL
+              AND reconciliation_deadline_at < ?
+            """,
+            (TaskStatus.RECONCILING.value, now),
+        ).fetchall()
+        for row in reconciliation_rows:
+            next_status = TaskStatus.TIMED_OUT.value
+            message = (
+                "cancellation requested; remote outcome remained unknown after "
+                "reconciliation deadline"
+                if row["cancel_requested_at"] is not None
+                else "remote outcome remained unknown after reconciliation deadline"
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, lease_expires_at = NULL,
+                    claim_token = NULL, updated_at = ?,
+                    finished_at = ?, error = ?, current_phase = ?,
+                    last_progress_at = ?, reconciliation_next_attempt_at = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    next_status,
+                    now,
+                    now,
+                    message,
+                    next_status,
+                    now,
+                    row["id"],
+                    TaskStatus.RECONCILING.value,
+                ),
+            )
+            self._append_event(
+                connection,
+                row["id"],
+                "reconciliation_expired",
+                now,
+                phase=next_status,
+                status=next_status,
+                worker_id=row["claimed_by"],
+                message=message,
+                details={"remote_run_id": row["remote_run_id"]},
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)

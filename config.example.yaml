@@ -12,6 +12,8 @@ coordinator:
   max_task_timeout_seconds: 7200
   default_max_attempts: 2
   maintenance_interval_seconds: 5
+  reconciliation_grace_seconds: 3600
+  reconciliation_backoff_seconds: 5
   planner:
     default_agent: codex
     commands:
