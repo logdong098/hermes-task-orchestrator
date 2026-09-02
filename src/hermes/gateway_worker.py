@@ -209,17 +209,28 @@ class GatewayWorker:
     async def run_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
         self.claim_tokens[task_id] = task["claim_token"]
-        run_id = task.get("remote_run_id")
-        attempt = task.get("attempt_count", 1)
-        if run_id and task.get("remote_run_attempt") != attempt:
-            LOGGER.warning(
-                "ignoring Gateway run %s from an older attempt of %s",
-                run_id,
-                task_id,
-            )
-            run_id = None
-        remote_bound = bool(run_id)
+        remote_bound = False
         try:
+            requested_agent = (
+                task.get("resolved_execution_agent")
+                or task.get("execution_agent")
+                or self.settings.default_agent
+            )
+            if requested_agent != self.settings.default_agent:
+                raise ValueError(
+                    "Gateway Worker cannot execute requested agent "
+                    f"{requested_agent!r}; use a Command Worker with an agent command mapping"
+                )
+            run_id = task.get("remote_run_id")
+            attempt = task.get("attempt_count", 1)
+            if run_id and task.get("remote_run_attempt") != attempt:
+                LOGGER.warning(
+                    "ignoring Gateway run %s from an older attempt of %s",
+                    run_id,
+                    task_id,
+                )
+                run_id = None
+            remote_bound = bool(run_id)
             profile = await self._profile(task)
             try:
                 await self.api.set_running(task_id, self.claim_tokens[task_id])
@@ -374,17 +385,6 @@ class GatewayWorker:
             remaining = max(0.0, started_at + timeout_seconds - time.time())
             deadline = asyncio.get_running_loop().time() + remaining
             while True:
-                session_id = self._session_id(run)
-                if session_id and session_id != attached_session_id:
-                    try:
-                        await self._attach(task_id, str(run_id), session_id)
-                    except httpx.HTTPError as exc:
-                        await self._mark_reconciling(
-                            task_id,
-                            f"remote session audit update failed: {exc}",
-                        )
-                        return
-                    attached_session_id = session_id
                 status = self._status(run)
                 if task_id in self.cancelled:
                     if status not in TERMINAL:
@@ -402,6 +402,36 @@ class GatewayWorker:
                         error="cancelled by director",
                     )
                     return
+                session_id = self._session_id(run)
+                if session_id and session_id != attached_session_id:
+                    try:
+                        await self._attach(task_id, str(run_id), session_id)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 409:
+                            stopped = await self._best_effort_stop(
+                                profile, str(run_id), "remote cancellation race"
+                            )
+                            if stopped is None:
+                                await self._mark_reconciling(
+                                    task_id,
+                                    "remote cancellation could not be confirmed",
+                                )
+                                return
+                            await self._report_remote(
+                                task_id,
+                                str(run_id),
+                                "cancelled",
+                                error="cancelled by director",
+                            )
+                            return
+                        raise
+                    except httpx.HTTPError as exc:
+                        await self._mark_reconciling(
+                            task_id,
+                            f"remote session audit update failed: {exc}",
+                        )
+                        return
+                    attached_session_id = session_id
                 if status in TERMINAL:
                     break
                 if asyncio.get_running_loop().time() >= deadline:
@@ -572,22 +602,34 @@ class GatewayWorker:
 async def run_gateway_worker(
     settings: GatewayWorkerSettings, once: bool = False
 ) -> None:
-    api = WorkerAPI(
-        settings.coordinator_url, settings.worker_id, settings.shared_secret
-    )
-    gateway = GatewayAdapter(
-        settings.gateway_url,
-        settings.gateway_token,
-        settings.profile_keys,
+    # Compatibility entrypoint: the deployed runtime is now the same unified
+    # control loop used by ``hermes-worker``.
+    from .config import UnifiedWorkerSettings
+    from .worker import run_unified_worker
+
+    unified_settings = UnifiedWorkerSettings(
+        coordinator_url=settings.coordinator_url,
+        worker_id=settings.worker_id,
+        worker_name=settings.worker_name,
+        shared_secret=settings.shared_secret,
+        default_agent="hermes",
+        agent_commands={"hermes": ["hermes", "chat", "-q", "{prompt}"]},
+        gateway_url=settings.gateway_url,
+        gateway_id=settings.gateway_id,
+        gateway_kind=settings.gateway_kind,
+        gateway_token=settings.gateway_token,
+        profile_keys=settings.profile_keys,
+        profiles=settings.profiles,
         default_profile=settings.default_profile,
-        configured_profiles=settings.profiles,
-        timeout=settings.gateway_request_timeout_seconds,
+        concurrency=settings.concurrency,
+        task_timeout_seconds=settings.task_timeout_seconds,
+        heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+        poll_interval_seconds=settings.poll_interval_seconds,
+        gateway_poll_interval_seconds=settings.gateway_poll_interval_seconds,
+        gateway_request_timeout_seconds=settings.gateway_request_timeout_seconds,
+        gateway_stop_wait_seconds=settings.gateway_stop_wait_seconds,
     )
-    try:
-        await GatewayWorker(settings, api, gateway).run(once)
-    finally:
-        await api.close()
-        await gateway.close()
+    await run_unified_worker(unified_settings, once=once)
 
 
 def main() -> None:

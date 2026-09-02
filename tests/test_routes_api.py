@@ -87,6 +87,16 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("homelab", response.json()["target_gateway_id"])
         self.assertEqual("architect", response.json()["target_profile"])
 
+    async def test_task_agent_alias_is_persisted_as_canonical_id(self) -> None:
+        response = await self.client.post(
+            "/api/v1/tasks",
+            json={"prompt": "use Claude Code", "execution_agent": "claude"},
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+
+        self.assertEqual(201, response.status_code, response.text)
+        self.assertEqual("claude-code", response.json()["execution_agent"])
+
     async def test_routes_require_director_auth_and_are_non_secret(self) -> None:
         response = await self.register_gateway_worker()
         self.assertEqual(200, response.status_code, response.text)
@@ -202,6 +212,36 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
             "no registered route matches the requested Gateway/Profile",
             response.json()["routing_diagnostic"],
         )
+
+    async def test_targeted_gateway_worker_preserves_agent_constraint(self) -> None:
+        response = await self.register_gateway_worker()
+        self.assertEqual(200, response.status_code, response.text)
+        task = self.store.create_task(
+            {
+                "prompt": "run with Claude Code",
+                "planner_agent": None,
+                "target_worker_id": "gateway-worker",
+                "execution_agent": "claude",
+            },
+            default_timeout_seconds=120,
+            max_timeout_seconds=120,
+            default_max_attempts=2,
+        )
+
+        response = await self.client.get(
+            f"/api/v1/tasks/{task['id']}",
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(
+            "matching route does not support the requested execution agent",
+            response.json()["routing_diagnostic"],
+        )
+
+        response = await self.worker_post("/api/v1/workers/gateway-worker/tasks/claim")
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertIsNone(response.json()["task"])
+        self.assertEqual("pending", self.store.get_task(task["id"])["status"])
 
 
 if __name__ == "__main__":

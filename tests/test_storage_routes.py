@@ -92,6 +92,155 @@ class StorageRouteTests(unittest.TestCase):
         self.assertEqual("codex", claimed["resolved_execution_agent"])
         self.assertIsNone(claimed["resolved_gateway_id"])
 
+    def test_unified_worker_uses_gateway_for_default_hermes(self) -> None:
+        self.store.register_worker(
+            {
+                "worker_id": "unified-worker",
+                "name": "Unified Worker",
+                "max_concurrency": 2,
+                "capabilities": ["agent:hermes", "agent:codex", "agent:claude-code"],
+                "metadata": {},
+                "worker_kind": "unified",
+                "default_agent": "hermes",
+                "routes": [
+                    {
+                        "route_id": "unified:default",
+                        "gateway_id": "local-hermes",
+                        "profile": "default",
+                        "target_profile": "default",
+                        "gateway_kind": "local",
+                        "supported_agents": ["hermes"],
+                        "default_agent": "hermes",
+                        "labels": {"default": "true"},
+                    }
+                ],
+            },
+            now=100,
+        )
+        task = self.create_task()
+
+        claimed = self.store.claim_task("unified-worker", 30, now=101)
+
+        self.assertEqual(task["id"], claimed["id"])
+        self.assertEqual("hermes", claimed["resolved_execution_agent"])
+        self.assertEqual("local-hermes", claimed["resolved_gateway_id"])
+        self.assertEqual("default", claimed["resolved_profile"])
+
+    def test_unified_worker_explicit_local_agent_uses_command_route(self) -> None:
+        self.store.register_worker(
+            {
+                "worker_id": "unified-worker",
+                "name": "Unified Worker",
+                "max_concurrency": 2,
+                "capabilities": ["agent:hermes", "agent:codex", "agent:claude-code"],
+                "metadata": {},
+                "worker_kind": "unified",
+                "default_agent": "hermes",
+                "routes": [
+                    {
+                        "route_id": "unified:default",
+                        "gateway_id": "local-hermes",
+                        "profile": "default",
+                        "target_profile": "default",
+                        "gateway_kind": "local",
+                        "supported_agents": ["hermes"],
+                        "default_agent": "hermes",
+                        "labels": {"default": "true"},
+                    }
+                ],
+            },
+            now=100,
+        )
+        task = self.create_task(execution_agent="codex")
+
+        claimed = self.store.claim_task("unified-worker", 30, now=101)
+
+        self.assertEqual(task["id"], claimed["id"])
+        self.assertEqual("codex", claimed["resolved_execution_agent"])
+        self.assertIsNone(claimed["resolved_gateway_id"])
+        self.assertEqual("unified-worker:command", claimed["resolved_route_id"])
+
+    def test_unified_worker_does_not_guess_gateway_profile(self) -> None:
+        self.store.register_worker(
+            {
+                "worker_id": "multi-unified-worker",
+                "name": "Multi Unified Worker",
+                "max_concurrency": 2,
+                "capabilities": ["agent:hermes"],
+                "metadata": {},
+                "worker_kind": "unified",
+                "default_agent": "hermes",
+                "routes": [
+                    {
+                        "route_id": "unified:first",
+                        "gateway_id": "local-hermes",
+                        "profile": "first",
+                        "target_profile": "first",
+                        "gateway_kind": "local",
+                        "supported_agents": ["hermes"],
+                        "default_agent": "hermes",
+                        "labels": {},
+                    },
+                    {
+                        "route_id": "unified:second",
+                        "gateway_id": "local-hermes",
+                        "profile": "second",
+                        "target_profile": "second",
+                        "gateway_kind": "local",
+                        "supported_agents": ["hermes"],
+                        "default_agent": "hermes",
+                        "labels": {},
+                    },
+                ],
+            },
+            now=100,
+        )
+        task = self.create_task(target_worker_id="multi-unified-worker")
+
+        self.assertIsNone(self.store.claim_task("multi-unified-worker", 30, now=101))
+        self.assertEqual("pending", self.store.get_task(task["id"])["status"])
+
+    def test_worker_targeted_gateway_task_resolves_unique_route(self) -> None:
+        self.store.register_worker(
+            {
+                "worker_id": "single-route-gateway",
+                "name": "Single Route Gateway",
+                "max_concurrency": 1,
+                "capabilities": ["agent:hermes"],
+                "metadata": {},
+                "worker_kind": "gateway",
+                "default_agent": "hermes",
+                "routes": [
+                    {
+                        "route_id": "homelab:single",
+                        "gateway_id": "homelab",
+                        "profile": "single",
+                        "target_profile": "single",
+                        "gateway_kind": "remote",
+                        "supported_agents": ["hermes"],
+                        "default_agent": "hermes",
+                        "labels": {},
+                    }
+                ],
+            },
+            now=100,
+        )
+        task = self.create_task(target_worker_id="single-route-gateway")
+
+        claimed = self.store.claim_task("single-route-gateway", 30, now=101)
+
+        self.assertEqual(task["id"], claimed["id"])
+        self.assertEqual("single-route-gateway", claimed["resolved_worker_id"])
+        self.assertEqual("homelab:single", claimed["resolved_route_id"])
+        self.assertEqual("homelab", claimed["resolved_gateway_id"])
+        self.assertEqual("single", claimed["resolved_profile"])
+
+    def test_worker_targeted_multi_route_gateway_task_stays_unclaimed(self) -> None:
+        task = self.create_task(target_worker_id="gateway-worker")
+
+        self.assertIsNone(self.store.claim_task("gateway-worker", 30, now=101))
+        self.assertEqual("pending", self.store.get_task(task["id"])["status"])
+
     def test_same_gateway_profiles_keep_distinct_agents(self) -> None:
         architect = self.create_task(
             target_gateway_id="homelab",
@@ -110,7 +259,7 @@ class StorageRouteTests(unittest.TestCase):
         self.assertEqual("hermes", first["resolved_execution_agent"])
         self.assertEqual(coder["id"], second["id"])
         self.assertEqual("coder", second["resolved_profile"])
-        self.assertEqual("claude", second["resolved_execution_agent"])
+        self.assertEqual("claude-code", second["resolved_execution_agent"])
 
     def test_stable_route_id_moves_to_replacement_worker(self) -> None:
         replacement = self.store.register_worker(

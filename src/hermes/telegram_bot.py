@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .config import TelegramSettings
+from .models import canonical_agent_name
 
 LOGGER = logging.getLogger("hermes.telegram")
 HELP_TEXT = """Hermes Director 命令：
@@ -21,8 +22,9 @@ HELP_TEXT = """Hermes Director 命令：
 /help - 显示帮助
 
 直接发送普通文本也会创建任务。
-@worker1 <任务> - 跳过规划，直接交给指定 Worker
-@Coordinator [@worker1] <任务> - 先规划，再自动或定向执行"""
+@worker [-codex|-cc|--executor/--agent <agent>] <任务> - 使用默认/在线 Worker 直接执行
+@worker1 [-codex|-cc|--executor/--agent <agent>] <任务> - 跳过规划，直接交给指定 Worker
+@Coordinator [@worker1] [-codex|-cc|--executor/--agent <agent>] <任务> - 先规划，再自动或定向执行"""
 
 
 class DirectorAPI:
@@ -290,12 +292,27 @@ class DirectorBot:
             return "未知命令。\n\n" + HELP_TEXT
         directives = self._parse_directives(text)
         if directives is not None:
-            prompt, wants_planning, worker_mentions, error = directives
+            (
+                prompt,
+                wants_planning,
+                worker_mentions,
+                execution_agent,
+                error,
+            ) = directives
             if error:
                 return error
             workers = await self.director.list_workers()
             worker_ids = {worker["worker_id"] for worker in workers}
             target_worker_id = worker_mentions[0] if worker_mentions else None
+            # ``@worker`` is the one-Worker shorthand.  If an installation
+            # really uses "worker" as its ID, keep treating it as a target;
+            # otherwise let Coordinator choose the available Worker.
+            if (
+                target_worker_id
+                and target_worker_id.casefold() == "worker"
+                and target_worker_id not in worker_ids
+            ):
+                target_worker_id = None
             if target_worker_id and target_worker_id not in worker_ids:
                 return (
                     f"未知 Worker：{target_worker_id}。请用 /agents 查看可用 Worker。"
@@ -307,13 +324,19 @@ class DirectorBot:
                 chat_id,
                 idempotency_key,
                 planner_agent=None,
-                execution_agent=None,
+                execution_agent=execution_agent,
                 target_worker_id=target_worker_id,
                 target_gateway_id=None,
                 target_profile=None,
                 planning_mode=planning_mode,
             )
-            return self._format_created_task(task)
+            detail = self._route_detail(
+                None,
+                execution_agent,
+                target_worker_id,
+            )
+            suffix = f"\n{detail}" if detail else ""
+            return f"{self._format_created_task(task)}{suffix}"
         task = await self.director.create_task(
             text,
             user_id,
@@ -331,8 +354,13 @@ class DirectorBot:
     @staticmethod
     def _parse_directives(
         text: str,
-    ) -> Optional[tuple[str, bool, List[str], Optional[str]]]:
-        tokens = text.split()
+    ) -> Optional[tuple[str, bool, List[str], Optional[str], Optional[str]]]:
+        try:
+            tokens = shlex.split(text)
+        except ValueError:
+            if text.lstrip().startswith("@"):
+                return "", False, [], None, "参数错误。指令中的引号不完整。"
+            return None
         if not tokens or not tokens[0].startswith("@"):
             return None
         index = 0
@@ -341,27 +369,66 @@ class DirectorBot:
         while index < len(tokens) and tokens[index].startswith("@"):
             name = tokens[index][1:]
             if not name:
-                return "", False, [], "@ 后必须指定 Coordinator 或 Worker ID。"
+                return "", False, [], None, "@ 后必须指定 Coordinator 或 Worker ID。"
             if name.casefold() == "coordinator":
                 coordinator_count += 1
             else:
                 worker_mentions.append(name)
             index += 1
         if coordinator_count > 1:
-            return "", False, [], "@Coordinator 只能指定一次。"
+            return "", False, [], None, "@Coordinator 只能指定一次。"
         if len(worker_mentions) > 1:
             if len(set(worker_mentions)) == 1:
-                return "", False, [], "同一个 Worker 只能指定一次。"
+                return "", False, [], None, "同一个 Worker 只能指定一次。"
             return (
                 "",
                 False,
                 [],
+                None,
                 "当前版本一次只能指定一个 Worker；多 Worker 工作流暂未启用。",
+            )
+        execution_agent: Optional[str] = None
+        while index < len(tokens) and (
+            tokens[index].startswith("--") or tokens[index] in ("-codex", "-cc")
+        ):
+            option = tokens[index]
+            if option in ("-codex", "-cc"):
+                if execution_agent is not None:
+                    return "", False, [], None, "参数错误。执行 Agent 只能指定一次。"
+                execution_agent = "codex" if option == "-codex" else "claude-code"
+                index += 1
+                continue
+            if option not in ("--agent", "--executor") or index + 1 >= len(tokens):
+                return (
+                    "",
+                    False,
+                    [],
+                    None,
+                    "参数错误。只支持 --executor <agent>（--agent 为兼容别名）。",
+                )
+            value = tokens[index + 1]
+            if not value or value.startswith("--") or execution_agent is not None:
+                return "", False, [], None, "参数错误。执行 Agent 只能指定一次。"
+            execution_agent = canonical_agent_name(value)
+            index += 2
+        if index < len(tokens) and tokens[index].startswith("-"):
+            return (
+                "",
+                False,
+                [],
+                None,
+                "参数错误。只支持 -codex、-cc 或 --executor <agent>。",
             )
         prompt = " ".join(tokens[index:]).strip()
         if not prompt:
-            return "", False, [], "请在 @ 指令后填写任务描述。"
-        return prompt, coordinator_count == 1, worker_mentions[:1], None
+            return "", False, [], None, "请在 @ 指令后填写任务描述。"
+        return (
+            prompt,
+            coordinator_count == 1,
+            worker_mentions[:1],
+            execution_agent,
+            None,
+        )
 
     @classmethod
     def _format_created_task(cls, task: Dict[str, Any]) -> str:
@@ -480,7 +547,7 @@ class DirectorBot:
             elif option in ("--agent", "--executor"):
                 if execution_agent is not None:
                     return None
-                execution_agent = value
+                execution_agent = canonical_agent_name(value)
             elif option == "--worker":
                 if target_worker_id is not None:
                     return None

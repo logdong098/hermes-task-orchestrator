@@ -38,6 +38,7 @@ def main() -> None:
         environment = os.environ.copy()
         environment.update(
             {
+                "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
                 "PYTHONPATH": str(source_root),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "HERMES_DATABASE_PATH": str(Path(temporary_directory) / "hermes.db"),
@@ -46,12 +47,25 @@ def main() -> None:
                 "HERMES_COORDINATOR_URL": base_url,
                 "HERMES_WORKER_ID": "e2e-worker",
                 "HERMES_WORKER_NAME": "E2E Mock Worker",
+                "HERMES_WORKER_DEFAULT_AGENT": "codex",
                 "HERMES_WORKER_ALLOWED_WORKDIR": temporary_directory,
                 "HERMES_WORKER_COMMAND": (
                     f"{sys.executable} -m hermes.mock_hermes -q {{prompt}}"
                 ),
+                "HERMES_WORKER_AGENTS_JSON": json.dumps(
+                    {
+                        "codex": [
+                            sys.executable,
+                            "-m",
+                            "hermes.mock_hermes",
+                            "-q",
+                            "{prompt}",
+                        ]
+                    }
+                ),
                 "HERMES_WORKER_POLL_INTERVAL_SECONDS": "1",
                 "HERMES_PLANNER_POLL_INTERVAL_SECONDS": "0.1",
+                "HERMES_PLANNER_DEFAULT_AGENT": "codex",
                 "HERMES_PLANNER_COMMANDS_JSON": json.dumps(
                     {
                         "codex": [

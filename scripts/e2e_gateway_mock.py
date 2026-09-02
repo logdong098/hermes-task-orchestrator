@@ -152,6 +152,7 @@ def main() -> None:
         environment = os.environ.copy()
         environment.update(
             {
+                "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
                 "PYTHONPATH": str(source_root),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "HERMES_DATABASE_PATH": str(Path(temporary_directory) / "hermes.db"),
@@ -171,6 +172,7 @@ def main() -> None:
                 "HERMES_GATEWAY_POLL_INTERVAL_SECONDS": "0.05",
                 "HERMES_GATEWAY_HEARTBEAT_INTERVAL_SECONDS": "1",
                 "HERMES_PLANNER_POLL_INTERVAL_SECONDS": "0.05",
+                "HERMES_PLANNER_DEFAULT_AGENT": "codex",
                 "HERMES_PLANNER_COMMANDS_JSON": json.dumps(
                     {
                         "codex": [
@@ -329,7 +331,10 @@ def main() -> None:
             cancel_result.raise_for_status()
             cancelled_task = cancel_result.json()
             if cancelled_task["status"] != "cancelled":
-                raise RuntimeError(f"Gateway task was not cancelled: {cancelled_task}")
+                raise RuntimeError(
+                    f"Gateway task was not cancelled: {cancelled_task}; "
+                    f"worker stderr={cancel_stderr!r}"
+                )
             if not FakeGatewayHandler.cancel_stopped:
                 raise RuntimeError("Gateway stop endpoint was not called")
             print(

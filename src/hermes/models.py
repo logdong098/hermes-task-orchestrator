@@ -10,6 +10,29 @@ from pydantic import BaseModel, Field, field_validator
 class WorkerKind(str, Enum):
     COMMAND = "command"
     GATEWAY = "gateway"
+    UNIFIED = "unified"
+
+
+AGENT_ALIASES = {
+    "cc": "claude-code",
+    "claude": "claude-code",
+}
+
+
+def canonical_agent_name(value: str) -> str:
+    """Return the stable execution-agent id used by the adapters."""
+    normalized = value.strip().lower()
+    return AGENT_ALIASES.get(normalized, normalized)
+
+
+def agent_names_match(left: str, right: str) -> bool:
+    return canonical_agent_name(left) == canonical_agent_name(right)
+
+
+def canonical_capability(value: str) -> str:
+    if value.startswith("agent:"):
+        return f"agent:{canonical_agent_name(value[6:])}"
+    return value
 
 
 class GatewayKind(str, Enum):
@@ -51,6 +74,16 @@ class WorkerRegistration(BaseModel):
     default_agent: str = Field(default="default", min_length=1, max_length=128)
     routes: List["WorkerRoute"] = Field(default_factory=list, max_length=128)
 
+    @field_validator("capabilities")
+    @classmethod
+    def normalize_capabilities(cls, value: List[str]) -> List[str]:
+        return [canonical_capability(item) for item in value]
+
+    @field_validator("default_agent")
+    @classmethod
+    def normalize_default_agent(cls, value: str) -> str:
+        return canonical_agent_name(value)
+
     def model_post_init(self, __context: Any) -> None:
         if self.worker_kind == WorkerKind.GATEWAY:
             if not self.routes:
@@ -59,8 +92,14 @@ class WorkerRegistration(BaseModel):
                 raise ValueError(
                     "gateway routes require non-blank gateway_id and profile"
                 )
-        elif self.routes:
+        elif self.worker_kind == WorkerKind.COMMAND and self.routes:
             raise ValueError("command workers cannot register gateway routes")
+        elif self.worker_kind == WorkerKind.UNIFIED:
+            for route in self.routes:
+                if bool(route.gateway_id) != bool(route.profile):
+                    raise ValueError(
+                        "unified worker routes require gateway_id and profile together"
+                    )
 
 
 class WorkerRoute(BaseModel):
@@ -72,6 +111,16 @@ class WorkerRoute(BaseModel):
     supported_agents: List[str] = Field(default_factory=list, max_length=128)
     default_agent: str = Field(default="default", min_length=1, max_length=128)
     labels: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("supported_agents")
+    @classmethod
+    def normalize_supported_agents(cls, value: List[str]) -> List[str]:
+        return [canonical_capability(item) for item in value]
+
+    @field_validator("default_agent")
+    @classmethod
+    def normalize_default_agent(cls, value: str) -> str:
+        return canonical_agent_name(value)
 
     @field_validator("gateway_id", "profile", "target_profile")
     @classmethod
@@ -142,7 +191,7 @@ class TaskCreate(BaseModel):
             character.isalnum() or character in "._-" for character in normalized
         ):
             raise ValueError("execution_agent contains unsupported characters")
-        return normalized
+        return canonical_agent_name(normalized)
 
     @field_validator("target_gateway_id", "target_profile")
     @classmethod

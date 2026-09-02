@@ -155,6 +155,18 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("succeeded", api.reports[-1][1])
         self.assertEqual("run-1", api.reports[-1][5])
 
+    async def test_explicit_unsupported_agent_fails_closed(self):
+        api = FakeAPI()
+        gateway = FakeGateway([])
+
+        await GatewayWorker(settings(), api, gateway).run_task(
+            task(execution_agent="claude", resolved_execution_agent="claude")
+        )
+
+        self.assertEqual([], gateway.starts)
+        self.assertEqual("failed", api.reports[-1][1])
+        self.assertIn("cannot execute requested agent", api.reports[-1][3])
+
     async def test_cancel_and_timeout_stop_remote_run(self):
         api = FakeAPI()
         gateway = FakeGateway([{"status": "cancelled"}])

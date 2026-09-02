@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
-from hermes.config import CoordinatorSettings, WorkerSettings
+from hermes.config import CoordinatorSettings, UnifiedWorkerSettings, WorkerSettings
 from hermes.coordinator import create_app
 from hermes.storage import SQLiteStore
-from hermes.worker import WorkerAPI, WorkerRuntime
+from hermes.worker import UnifiedWorkerRuntime, WorkerAPI, WorkerRuntime
 
 
 class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -137,7 +140,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ],
             runtime.command_for("plan", "claude"),
         )
-        self.assertEqual(["agent:claude", "agent:codex"], runtime.capabilities())
+        self.assertEqual(["agent:claude-code", "agent:codex"], runtime.capabilities())
         with self.assertRaises(ValueError):
             runtime.command_for("x", "unknown")
 
@@ -156,6 +159,147 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = self.store.get_task(task_id)
         self.assertEqual("succeeded", result["status"])
         self.assertEqual("claude: specialized\n", result["result"])
+
+    async def test_unified_worker_executes_local_agent_and_registers_unified_kind(
+        self,
+    ) -> None:
+        settings = UnifiedWorkerSettings(
+            coordinator_url="http://test",
+            worker_id="unified-worker",
+            worker_name="Unified Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "codex": [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('unified: ' + sys.argv[1])",
+                    "{prompt}",
+                ]
+            },
+            allowed_workdir=self.temporary_directory.name,
+            gateway_url="",
+            gateway_id="",
+            poll_interval_seconds=0,
+        )
+        created = self.store.create_task(
+            {"prompt": "unified hello", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        api = WorkerAPI(
+            "http://test", "unified-worker", "worker-test-secret", self.client
+        )
+        await UnifiedWorkerRuntime(settings, api).run(once=True)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual("unified: unified hello\n", result["result"])
+        worker = self.store.list_workers(stale_seconds=45)[-1]
+        self.assertEqual("unified", worker["worker_kind"])
+
+    async def test_unified_worker_preserves_legacy_command_only_environment(
+        self,
+    ) -> None:
+        command = (
+            f"{sys.executable} -c \"import sys; print('legacy: ' + sys.argv[1])\" "
+            "{prompt}"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
+                    "HERMES_COORDINATOR_URL": "http://test",
+                    "HERMES_WORKER_ID": "legacy-worker",
+                    "HERMES_WORKER_SHARED_SECRET": "worker-test-secret",
+                    "HERMES_WORKER_COMMAND": command,
+                    "HERMES_WORKER_ALLOWED_WORKDIR": self.temporary_directory.name,
+                    "HERMES_WORKER_POLL_INTERVAL_SECONDS": "0",
+                },
+                clear=True,
+            ):
+                settings = UnifiedWorkerSettings.from_env()
+
+        self.assertFalse(settings.gateway_enabled)
+        created = self.store.create_task(
+            {"prompt": "legacy hello", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        api = WorkerAPI(
+            "http://test", "legacy-worker", "worker-test-secret", self.client
+        )
+        await UnifiedWorkerRuntime(settings, api).run(once=True)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual("legacy: legacy hello\n", result["result"])
+
+    async def test_local_agent_process_does_not_receive_hermes_control_secrets(
+        self,
+    ) -> None:
+        script = (
+            "import json, os; print(json.dumps({"
+            "'worker_secret': bool(os.getenv('HERMES_WORKER_SHARED_SECRET')),"
+            "'director_key': bool(os.getenv('HERMES_DIRECTOR_API_KEY')),"
+            "'gateway_token': bool(os.getenv('HERMES_GATEWAY_TOKEN')),"
+            "'profile_keys': bool(os.getenv('HERMES_GATEWAY_PROFILE_KEYS_JSON')),"
+            "'safe_setting': os.getenv('HERMES_SAFE_SETTING'),"
+            "'provider_key': os.getenv('OPENAI_API_KEY')"
+            "}, sort_keys=True))"
+        )
+        settings = WorkerSettings(
+            coordinator_url="http://test",
+            worker_id="mock-worker",
+            worker_name="Mock Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "codex": [sys.executable, "-c", script, "{prompt}"],
+            },
+            allowed_workdir=self.temporary_directory.name,
+        )
+        await self.api.register("Mock Worker", 1)
+        created = self.store.create_task(
+            {"prompt": "inspect environment", "timeout_seconds": 10},
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        task = await self.api.claim()
+        self.assertEqual(created["id"], task["id"])
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_WORKER_SHARED_SECRET": "worker-secret",
+                "HERMES_DIRECTOR_API_KEY": "director-key",
+                "HERMES_GATEWAY_TOKEN": "gateway-token",
+                "HERMES_GATEWAY_PROFILE_KEYS_JSON": '{"default":"profile-key"}',
+                "HERMES_SAFE_SETTING": "visible",
+                "OPENAI_API_KEY": "provider-key",
+            },
+            clear=True,
+        ):
+            await WorkerRuntime(settings, self.api).run_task(task)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual(
+            {
+                "director_key": False,
+                "gateway_token": False,
+                "profile_keys": False,
+                "provider_key": "provider-key",
+                "safe_setting": "visible",
+                "worker_secret": False,
+            },
+            json.loads(result["result"]),
+        )
 
 
 if __name__ == "__main__":

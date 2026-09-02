@@ -9,11 +9,11 @@
 ## 组件
 
 - `coordinator`：FastAPI + SQLite，负责认证 API、任务状态机，并在本机运行 Claude/Codex Planner。
-- `worker`：按 Agent 能力领取任务，以无 shell的参数数组启动本机 Agent，支持并发、超时和取消。
+- `worker`：单一 Worker 进程，按默认或任务指定的 Agent 分流；Hermes 任务走 Gateway，Codex/Claude Code 任务启动本机 CLI，并统一负责心跳、取消、状态和结果回传。
 - `telegram`：单个 Director Bot，提供 `/agents`、`/tasks`、`/new`、`/status`、`/cancel`、`/help`，并推送结果。
 - `mock_hermes`：不访问外部服务的假 Hermes 命令，仅用于开发和测试。
 
-M0/M1 还提供 `gateway-worker`：它是无 GUI 的 Hermes Gateway 适配 Worker，直接访问 Worker 所在机器上的 Hermes API Server（默认 `8642`），按 `(gateway_id, profile)` 注册和领取任务。Hermes Desktop 不是运行依赖；M2 Desktop Fleet Plugin、M3 自动路由与 `task_attempts` 历史审计、M4 Bridge/delegation 当前均未实现。
+`gateway-worker` 仍作为迁移期兼容入口，但内部复用同一个 Unified Worker 控制环。Hermes Desktop 不是运行依赖；M2 Desktop Fleet Plugin、M3 自动路由与 `task_attempts` 历史审计、M4 Bridge/delegation 当前均未实现。
 
 ## 从零启动
 
@@ -26,7 +26,7 @@ python3 -m venv .venv
 cp .env.example .env
 ```
 
-`.env.example` 是配置入口。Coordinator、普通 Command Worker 和 Gateway Worker 可以使用各自机器上的 `.env`；不要把真实 key 写入 Git 或复制到 Coordinator。
+`.env.example` 是配置入口。Coordinator、Unified Worker 和 Telegram 可以使用各自机器上的 `.env`；不要把真实 key 写入 Git 或复制到 Coordinator。
 
 仓库同时提供 `setup.py/setup.cfg` 兼容入口；`--no-build-isolation` 会复用虚拟环境中已有的 setuptools，因此上述 editable 安装兼容 pip 21.2.4，不要求先升级 pip，也不会为了构建隔离环境重复下载 setuptools。如果受限网络只能使用环境中已有的运行时包，也可执行 `.venv/bin/python -m pip install -r requirements-dev.txt`，随后使用 Makefile（其命令会设置 `PYTHONPATH=src`）。
 
@@ -45,8 +45,8 @@ install -m 600 /path/to/role-specific.env /opt/hermes/.env
 | 机器/进程 | 必需配置 | 启动命令 |
 | --- | --- | --- |
 | Coordinator | 数据库、Director key、Worker secret、Planner 命令 | `hermes-coordinator` |
-| Command Worker | Coordinator URL、Worker ID/secret、Agent 命令和允许目录 | `hermes-worker` |
-| Gateway Worker | Coordinator URL、Worker ID/secret、Gateway ID/URL、Profiles 和各 Profile key | `hermes-gateway-worker` |
+| Unified Worker | Coordinator URL、Worker ID/secret、Agent 命令、Gateway URL/Profiles 和各 Profile key | `hermes-worker` |
+| 兼容 Gateway Worker | 同上，仅保留旧配置/入口兼容 | `hermes-gateway-worker` |
 | Telegram（可选） | Coordinator URL、Director key、Bot Token、用户 allowlist | `hermes-telegram` |
 
 所有长期进程启动时都从其当前工作目录读取 `.env`。同一台机器运行多个角色时，使用不同工作目录和不同 `.env`，避免把 Gateway Profile key 放到 Coordinator 环境。
@@ -75,12 +75,19 @@ HERMES_PLANNER_COMMANDS_JSON={"claude":["claude","--permission-mode","plan","-p"
 
 默认模板把 Claude 固定为 `plan` 权限模式、把 Codex 固定为 `read-only` sandbox，Planner 只负责读取上下文并输出执行计划。覆盖命令时应保留等价的只读限制；真正的文件修改只在 Worker 执行阶段发生。
 
-Worker 未收到 `execution_agent` 时使用默认命令。要允许用户显式选择 Claude/Codex，请配置能力映射：
+Unified Worker 未收到 `execution_agent` 时使用 `HERMES_WORKER_DEFAULT_AGENT`。本地 Codex/Claude Code 使用 Agent 命令映射；Hermes 使用 Gateway 配置：
 
 ```dotenv
-HERMES_WORKER_DEFAULT_AGENT=codex
-HERMES_WORKER_AGENTS_JSON={"claude":["claude","-p","{prompt}"],"codex":["codex","exec","{prompt}"]}
+HERMES_WORKER_DEFAULT_AGENT=hermes
+HERMES_WORKER_AGENTS_JSON={"codex":["codex","exec","{prompt}"],"claude-code":["claude","-p","{prompt}"]}
+HERMES_GATEWAY_URL=http://127.0.0.1:8642
+HERMES_GATEWAY_ID=local-hermes
+HERMES_GATEWAY_PROFILES=default
+HERMES_GATEWAY_DEFAULT_PROFILE=default
+HERMES_GATEWAY_PROFILE_KEYS_JSON={"default":"<profile-key>"}
 ```
+
+旧部署也可将同样格式配置在 `HERMES_AGENT_COMMANDS`；`hermes-worker` 会将它作为兼容别名读取。`claude`/`cc` 是 `claude-code` 的兼容别名，新的稳定 Agent ID 是 `claude-code`。
 
 Coordinator 主机必须安装并能运行所配置的 Planner CLI；Worker 主机只需安装自己映射中的执行 Agent。`HERMES_WORKER_COMMAND` 继续作为默认 Agent 的兼容入口，无需一次性改造旧部署。
 
@@ -100,7 +107,7 @@ make coordinator
 make worker
 ```
 
-### M1 Gateway Worker（无 Hermes Desktop）
+### Unified Worker 与 Hermes Gateway（无 Hermes Desktop）
 
 先启用 Hermes 的多 Profile 共享监听：
 
@@ -132,22 +139,34 @@ curl -sS -H 'Authorization: Bearer <architect-profile-key>' \
   http://127.0.0.1:8642/p/architect/v1/capabilities
 ```
 
-M1 使用 `/p/<profile>/v1/runs`、`/p/<profile>/v1/runs/<run_id>` 和对应的 `/stop` 接口。Gateway Worker 只需要访问 Coordinator 和该 API Server：
+M1 使用 `/p/<profile>/v1/runs`、`/p/<profile>/v1/runs/<run_id>` 和对应的 `/stop` 接口。Unified Worker 同时访问 Coordinator、该 API Server 和本机工程目录：
 
 ```bash
-HERMES_GATEWAY_WORKER_ID=mac-hermes-gateway \
+HERMES_WORKER_ID=mac-unified-worker \
+HERMES_WORKER_DEFAULT_AGENT=hermes \
 HERMES_GATEWAY_ID=mac-hermes \
 HERMES_GATEWAY_KIND=local \
 HERMES_GATEWAY_URL=http://127.0.0.1:8642 \
 HERMES_GATEWAY_PROFILES=architect,coder \
-HERMES_GATEWAY_DEFAULT_PROFILE=default \
+HERMES_GATEWAY_DEFAULT_PROFILE=architect \
 HERMES_GATEWAY_PROFILE_KEYS_JSON='{"architect":"<architect-key>","coder":"<coder-key>"}' \
-hermes-gateway-worker
+hermes-worker
 ```
 
-每个 Profile 使用独立 key；`target_gateway_id` 与 `target_profile` 必须同时指定。任务被 Coordinator 精确解析后，Gateway Worker 会把 resolved Profile 传给 Hermes API，不会把同 Gateway 的其他 Profile 当作 fallback。M1 Gateway Worker 只宣告并接受 `execution_agent=hermes`，`HERMES_GATEWAY_DEFAULT_AGENT` 必须保持 `hermes`；Claude/Codex 应由 Command Worker 执行。关闭 Desktop 不影响这条生产路径。
+每个 Profile 使用独立 key；`target_gateway_id` 与 `target_profile` 必须同时指定。任务被 Coordinator 精确解析后，Unified Worker 会把 resolved Profile 传给 Hermes API，不会把同 Gateway 的其他 Profile 当作 fallback。没有 Gateway/Profile 定位时，只有单个 Profile 或显式默认 Profile 才会执行默认 Hermes 任务，避免随机选择错误 Profile。关闭 Desktop 不影响这条生产路径。
 
-`HERMES_GATEWAY_PROFILES` 建议在生产环境显式配置。若留空并依赖 `GET /api/profiles` 自动发现，则 `HERMES_GATEWAY_TOKEN` 必须设置为 `HERMES_GATEWAY_DEFAULT_PROFILE`（默认名为 `default`）的 key；命名 Profile 的请求仍必须使用 `HERMES_GATEWAY_PROFILE_KEYS_JSON` 中各自的 key，缺失时 Gateway Worker 会拒绝执行，不会回退到默认 key。
+`--planner claude` 只选择 Coordinator 本机的规划程序，不会改变执行 Agent。执行任务时由同一个 Unified Worker 按默认配置或显式覆盖选择后端：
+
+```text
+@<worker-id> <任务>             # 使用 Worker 默认 Agent
+@<worker-id> -codex <任务>      # 本次使用 Codex
+@<worker-id> -cc <任务>         # 本次使用 Claude Code
+@<worker-id> --executor claude-code <任务>  # 长参数兼容写法
+```
+
+如果把 `--executor codex` 指向 Gateway/Profile 路由，或指定了 Worker 不支持的 Agent，任务会保持 `pending` 并显示路由不支持该 Agent 的原因，不会悄悄 fallback 到其他 Agent。
+
+`HERMES_GATEWAY_PROFILES` 建议在生产环境显式配置。若留空并依赖 `GET /api/profiles` 自动发现，则 `HERMES_GATEWAY_TOKEN` 必须设置为 `HERMES_GATEWAY_DEFAULT_PROFILE`（默认名为 `default`）的 key；命名 Profile 的请求仍必须使用 `HERMES_GATEWAY_PROFILE_KEYS_JSON` 中各自的 key，缺失时 Unified Worker 会拒绝执行，不会回退到默认 key。
 
 如果 Coordinator 在另一台机器上，请把 `HERMES_COORDINATOR_URL` 设置为其 Tailscale/WireGuard 私网地址（例如 `https://100.x.y.z`），不要把 Worker API 暴露到公网。Hermes API Server 也应只绑定 localhost 或 VPN 网卡，并通过 HTTPS/SSH 隧道保护跨主机流量。
 
@@ -255,12 +274,15 @@ Telegram Bot 默认收不到其他 Bot 发送的消息。因此本项目不把�
 
 ```text
 /new [--planner claude|codex] [--agent <agent>] <任务描述>
-@worker-a 修复登录页文案并运行相关测试
+@worker 修复登录页文案并运行相关测试
+@worker -cc 修复登录页文案并运行相关测试
+@worker -codex 修复登录页文案并运行相关测试
+@worker-a 修复登录页文案并运行相关测试  # 也可以指定具体 Worker ID
 @Coordinator 分析这个开发计划并给出执行方案
 @Coordinator @worker-a 分析并由指定 Worker 实现登录模块
 ```
 
-`@worker-a` 使用 `direct` 模式，跳过 Planner，但任务仍由 Coordinator 持久化、鉴权、调度和跟踪。`@Coordinator` 使用 `plan` 模式；它与 Worker 的先后顺序可以互换。当前 P0/P1 一条任务只允许一个 Worker，`->`、多 Worker DAG 和工作流编排暂未实现。
+`@worker` 使用 `direct` 模式，跳过 Planner，由 Coordinator 选择在线 Worker；在单 Worker 部署中就是唯一的 Unified Worker。也可以写具体 Worker ID（如 `@worker-a`）。任务仍由 Coordinator 持久化、鉴权、调度和跟踪；未指定 Agent 时使用 Worker 默认配置，`-codex`、`-cc` 或 `--executor`（兼容别名 `--agent`）会覆盖本次任务。`@Coordinator` 使用 `plan` 模式；它与 Worker 的先后顺序可以互换。当前 P0/P1 一条任务只允许一个 Worker，`->`、多 Worker DAG 和工作流编排暂未实现。
 
 M1 Telegram 路由语法为：
 
@@ -285,7 +307,7 @@ make e2e
 
 Makefile 会优先使用仓库内的 `.venv/bin/python`；也可以显式执行 `PYTHON=.venv/bin/python make test`。未创建 `.venv` 时才回退到系统 `python3`。
 
-`make e2e` 会运行两条真实 HTTP 进程链路：Command Worker mock，以及直接调用 profile-scoped Runs API 的 Gateway Worker mock。第二条链路不会启动或依赖 Hermes Desktop GUI。
+`make e2e` 会运行两条真实 HTTP 进程链路：本地 Agent mock，以及直接调用 profile-scoped Runs API 的 Unified Worker mock。第二条链路不会启动或依赖 Hermes Desktop GUI。
 
 ## Docker Compose
 
@@ -304,22 +326,22 @@ mkdir -p workspace
 docker compose --profile worker up --build
 ```
 
-Compose 中的 `gateway-worker` profile 适合 Gateway 运行在 Docker 宿主机且监听 `8642` 的开发环境：
+Compose 中的 `gateway-worker` profile 仍可作为旧 Gateway 入口兼容测试；新部署建议把 Gateway 配置合并到 `worker` profile：
 
 ```bash
 export HERMES_GATEWAY_PROFILE_KEYS_JSON='{"default":"<profile-key>"}'
 docker compose --profile gateway-worker up --build
 ```
 
-Compose 使用 `host.docker.internal:8642`（Linux 通过 `host-gateway` 映射）。Hermes API 若只绑定 `127.0.0.1`，Linux 容器通常无法访问；Linux 优先在宿主机直接运行 Gateway Worker，或把 API Server 只绑定到受防火墙保护的 Docker bridge/VPN 地址，并相应设置 `HERMES_GATEWAY_URL`。不要为了容器访问直接把 `8642` 裸露到所有网络。生产环境在宿主机运行也能避免 keychain、SSH agent 和 Hermes 本地凭据进入容器。Compose 不启动、不依赖 Hermes Desktop。
+Compose 使用 `host.docker.internal:8642`（Linux 通过 `host-gateway` 映射）。Hermes API 若只绑定 `127.0.0.1`，Linux 容器通常无法访问；Linux 优先在宿主机直接运行 Unified Worker，或把 API Server 只绑定到受防火墙保护的 Docker bridge/VPN 地址，并相应设置 `HERMES_GATEWAY_URL`。不要为了容器访问直接把 `8642` 裸露到所有网络。生产环境在宿主机运行也能避免 keychain、SSH agent 和 Hermes 本地凭据进入容器。Compose 不启动、不依赖 Hermes Desktop。
 
 ### systemd / launchd
 
-Coordinator、Command Worker、Gateway Worker 和 Telegram 应分别作为长期运行服务；每个服务使用独立低权限系统用户、独立 `.env` 和工作目录。Linux Gateway Worker 示例：
+Coordinator、Unified Worker 和 Telegram 应分别作为长期运行服务；每个服务使用独立低权限系统用户、独立 `.env` 和工作目录。Linux Unified Worker 示例：
 
 ```ini
 [Unit]
-Description=Hermes Gateway Worker
+Description=Hermes Unified Worker
 After=network-online.target
 Wants=network-online.target
 
@@ -328,8 +350,8 @@ Type=simple
 User=hermes
 Group=hermes
 WorkingDirectory=/opt/hermes
-EnvironmentFile=/etc/hermes/gateway-worker.env
-ExecStart=/opt/hermes/.venv/bin/python -m hermes.gateway_worker
+EnvironmentFile=/etc/hermes/worker.env
+ExecStart=/opt/hermes/.venv/bin/python -m hermes.worker
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
@@ -339,9 +361,9 @@ PrivateTmp=true
 WantedBy=multi-user.target
 ```
 
-保存为 `/etc/systemd/system/hermes-gateway-worker.service` 后执行 `systemctl daemon-reload && systemctl enable --now hermes-gateway-worker`。Coordinator 和 Command Worker 只需替换 `EnvironmentFile` 与 `ExecStart`。
+保存为 `/etc/systemd/system/hermes-worker.service` 后执行 `systemctl daemon-reload && systemctl enable --now hermes-worker`。Coordinator 和 Telegram 只需替换 `EnvironmentFile` 与 `ExecStart`。
 
-macOS 使用 launchd 时，将 `/opt/hermes/.venv/bin/hermes-gateway-worker` 放入 `ProgramArguments`，把 `WorkingDirectory` 指向只包含该角色 `.env` 的受限目录，并设置 `KeepAlive=true`。`.env` 权限应为 `600`；不要把 key 直接写进 unit、plist 或日志。修改 plist 后使用 `launchctl bootstrap` 加载，升级时先 `launchctl bootout`，备份数据库/配置，重新安装包后再加载。
+macOS 使用 launchd 时，将 `/opt/hermes/.venv/bin/hermes-worker` 放入 `ProgramArguments`，把 `WorkingDirectory` 指向只包含该角色 `.env` 的受限目录，并设置 `KeepAlive=true`。`.env` 权限应为 `600`；不要把 key 直接写进 unit、plist 或日志。修改 plist 后使用 `launchctl bootstrap` 加载，升级时先 `launchctl bootout`，备份数据库/配置，重新安装包后再加载。
 
 ### 数据库备份与迁移
 
@@ -386,10 +408,10 @@ docker compose --profile telegram up --build
 src/hermes/
   coordinator.py    FastAPI 应用与 API 鉴权
   gateway_adapter.py Hermes profile-scoped Runs API 客户端
-  gateway_worker.py 无 GUI Gateway Worker
+  gateway_worker.py 旧 Gateway Worker 兼容入口
   planner.py        Coordinator 本地规划子进程与计划产物
   storage.py        SQLite Repository、原子领取和状态机
-  worker.py         Worker API 客户端和子进程执行器
+  worker.py         Unified Worker 控制环、Agent 分流和子进程执行器
   telegram_bot.py   Telegram 长轮询与命令处理
   security.py       HMAC 签名与校验
   config.py         环境变量配置和脱敏工具

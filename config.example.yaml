@@ -30,19 +30,17 @@ worker:
   id: macbook-worker-01
   name: MacBook Worker 01
   command: [hermes, chat, -q, "{prompt}"]
-  default_agent: default
-  agent_commands: {}
+  default_agent: hermes
+  # HERMES_WORKER_AGENTS_JSON (or legacy HERMES_AGENT_COMMANDS) supplies
+  # per-agent argv templates containing {prompt}. Hermes uses Gateway below.
+  agent_commands:
+    codex: [codex, exec, "{prompt}"]
+    claude-code: [claude, -p, "{prompt}"]
   allowed_workdir: /absolute/path/to/allowed/workspace
   concurrency: 1
   task_timeout_seconds: 900
   heartbeat_interval_seconds: 10
   poll_interval_seconds: 2
-
-# M1 无 GUI Gateway Worker；与普通 worker 分开运行并使用不同 worker id。
-gateway_worker:
-  coordinator_url: http://127.0.0.1:8000
-  id: hermes-gateway-worker-01
-  name: Hermes Gateway Worker 01
   gateway_url: http://127.0.0.1:8642
   gateway_id: local-hermes
   gateway_kind: local
@@ -51,14 +49,12 @@ gateway_worker:
   profile_keys: {}
   profiles: [default]
   default_profile: default
-  default_agent: hermes
-  concurrency: 1
-  task_timeout_seconds: 900
-  heartbeat_interval_seconds: 10
-  poll_interval_seconds: 2
   gateway_poll_interval_seconds: 2
   gateway_request_timeout_seconds: 30
   gateway_stop_wait_seconds: 30
+
+# 旧版 gateway_worker 配置和 hermes-gateway-worker 入口仅作为迁移兼容，
+# 新部署只配置并启动上面的一个 worker。
 
 telegram:
   enabled: false

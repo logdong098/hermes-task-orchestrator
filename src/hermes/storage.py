@@ -7,7 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .models import TERMINAL_STATUSES, TaskStatus
+from .models import (
+    TERMINAL_STATUSES,
+    TaskStatus,
+    agent_names_match,
+    canonical_agent_name,
+)
 
 
 class ConflictError(RuntimeError):
@@ -361,11 +366,48 @@ class SQLiteStore:
         data["labels"] = json.loads(data.pop("labels_json"))
         return data
 
+    @staticmethod
+    def _worker_kind(worker: Dict[str, Any]) -> str:
+        value = worker.get("worker_kind", "command")
+        return str(getattr(value, "value", value))
+
+    @staticmethod
+    def _route_supports_agent(route: sqlite3.Row, agent: str) -> bool:
+        supported = json.loads(route["supported_agents_json"])
+        return any(
+            agent_names_match(agent, item[6:] if item.startswith("agent:") else item)
+            for item in supported
+            if isinstance(item, str)
+        )
+
+    @staticmethod
+    def _capabilities_support_agent(capabilities: set[str], agent: str) -> bool:
+        return any(
+            capability.startswith("agent:") and agent_names_match(agent, capability[6:])
+            for capability in capabilities
+        )
+
+    @staticmethod
+    def _canonical_capabilities(values: List[Any]) -> List[Any]:
+        return [
+            f"agent:{canonical_agent_name(value[6:])}"
+            if isinstance(value, str) and value.startswith("agent:")
+            else value
+            for value in values
+        ]
+
     def register_worker(
         self, worker: Dict[str, Any], now: Optional[float] = None
     ) -> Dict[str, Any]:
         current = now if now is not None else time.time()
-        if worker.get("worker_kind", "command") == "gateway":
+        worker_kind = self._worker_kind(worker)
+        worker_capabilities = self._canonical_capabilities(worker["capabilities"])
+        metadata_default_agent = worker.get("metadata", {}).get("default_agent")
+        worker_default_agent = worker.get("default_agent", "default")
+        if worker_default_agent == "default" and metadata_default_agent:
+            worker_default_agent = metadata_default_agent
+        worker_default_agent = canonical_agent_name(worker_default_agent)
+        if worker_kind == "gateway":
             routes = worker.get("routes") or []
             if not routes:
                 raise ConflictError("gateway workers must register at least one route")
@@ -375,8 +417,10 @@ class SQLiteStore:
                     raise ConflictError(
                         "gateway routes require non-blank gateway_id and profile"
                     )
-        elif worker.get("routes"):
+        elif worker_kind == "command" and worker.get("routes"):
             raise ConflictError("command workers cannot register gateway routes")
+        elif worker_kind not in {"command", "unified"}:
+            raise ConflictError(f"unsupported worker kind: {worker_kind}")
         with self._connect() as connection:
             connection.execute(
                 """
@@ -398,45 +442,50 @@ class SQLiteStore:
                     worker["worker_id"],
                     worker["name"],
                     worker["max_concurrency"],
-                    self._json(worker["capabilities"]),
+                    self._json(worker_capabilities),
                     self._json(worker["metadata"]),
                     current,
                     current,
-                    worker.get("worker_kind", "command"),
-                    (
-                        worker.get("metadata", {}).get("default_agent")
-                        if worker.get("default_agent", "default") == "default"
-                        and worker.get("metadata", {}).get("default_agent")
-                        else worker.get("default_agent", "default")
-                    ),
+                    worker_kind,
+                    worker_default_agent,
                 ),
             )
             connection.execute(
                 "DELETE FROM worker_routes WHERE worker_id = ?", (worker["worker_id"],)
             )
-            routes = worker.get("routes") or []
-            if not routes and worker.get("worker_kind", "command") == "command":
-                routes = [
+            routes = list(worker.get("routes") or [])
+            has_local_route = any(
+                not (
+                    (route.model_dump() if hasattr(route, "model_dump") else route).get(
+                        "gateway_id"
+                    )
+                    or (
+                        route.model_dump() if hasattr(route, "model_dump") else route
+                    ).get("profile")
+                )
+                for route in routes
+            )
+            if worker_kind == "command" or (
+                worker_kind == "unified" and not has_local_route
+            ):
+                effective_default_agent = worker_default_agent
+                local_supported_agents = [
+                    item[6:]
+                    for item in worker_capabilities
+                    if isinstance(item, str) and item.startswith("agent:")
+                ]
+                routes.append(
                     {
                         "route_id": f"{worker['worker_id']}:command",
                         "gateway_id": None,
                         "profile": None,
                         "target_profile": None,
                         "gateway_kind": "local",
-                        "supported_agents": [
-                            item[6:]
-                            for item in worker["capabilities"]
-                            if item.startswith("agent:")
-                        ],
-                        "default_agent": (
-                            worker.get("metadata", {}).get("default_agent")
-                            if worker.get("default_agent", "default") == "default"
-                            and worker.get("metadata", {}).get("default_agent")
-                            else worker.get("default_agent", "default")
-                        ),
+                        "supported_agents": local_supported_agents,
+                        "default_agent": effective_default_agent,
                         "labels": {},
                     }
-                ]
+                )
             for route in routes:
                 route = route.model_dump() if hasattr(route, "model_dump") else route
                 connection.execute(
@@ -461,8 +510,12 @@ class SQLiteStore:
                         route.get("profile"),
                         route.get("target_profile"),
                         route.get("gateway_kind", "local"),
-                        self._json(route.get("supported_agents", [])),
-                        route.get("default_agent", "default"),
+                        self._json(
+                            self._canonical_capabilities(
+                                route.get("supported_agents", [])
+                            )
+                        ),
+                        canonical_agent_name(route.get("default_agent", "default")),
                         self._json(route.get("labels", {})),
                         current,
                     ),
@@ -553,8 +606,12 @@ class SQLiteStore:
                             route.get("profile"),
                             route.get("target_profile"),
                             route.get("gateway_kind", "local"),
-                            self._json(route.get("supported_agents", [])),
-                            route.get("default_agent", "default"),
+                            self._json(
+                                self._canonical_capabilities(
+                                    route.get("supported_agents", [])
+                                )
+                            ),
+                            canonical_agent_name(route.get("default_agent", "default")),
                             self._json(route.get("labels", {})),
                             current,
                         ),
@@ -671,6 +728,9 @@ class SQLiteStore:
         task_id = str(uuid.uuid4())
         planner_agent = task.get("planner_agent")
         planning_mode = task.get("planning_mode", "auto")
+        execution_agent = task.get("execution_agent")
+        if execution_agent is not None:
+            execution_agent = canonical_agent_name(execution_agent)
         if planning_mode == "auto":
             planning_mode = "plan" if planner_agent else "direct"
         initial_status = (
@@ -695,7 +755,7 @@ class SQLiteStore:
             task.get("idempotency_key"),
             planner_agent,
             planning_mode,
-            task.get("execution_agent"),
+            execution_agent,
             default_planner_max_attempts,
             initial_phase,
             current,
@@ -817,12 +877,16 @@ class SQLiteStore:
                 WHERE (
                     status = ?
                     AND (target_worker_id IS NULL OR target_worker_id = ?)
-                    AND (target_gateway_id IS NOT NULL OR ? = 'command')
+                    AND (
+                        target_gateway_id IS NOT NULL
+                        OR ? IN ('command', 'unified')
+                        OR target_worker_id = ?
+                    )
                 ) OR (
                     status = ?
                     AND remote_run_id IS NOT NULL
                     AND resolved_worker_id = ?
-                    AND ? = 'gateway'
+                    AND ? IN ('gateway', 'unified')
                     AND (
                         reconciliation_next_attempt_at IS NULL
                         OR reconciliation_next_attempt_at <= ?
@@ -834,6 +898,7 @@ class SQLiteStore:
                     TaskStatus.PENDING.value,
                     worker_id,
                     worker["worker_kind"],
+                    worker_id,
                     TaskStatus.RECONCILING.value,
                     worker_id,
                     worker["worker_kind"],
@@ -863,16 +928,61 @@ class SQLiteStore:
                     )
                     if route is None:
                         continue
+                elif worker["worker_kind"] == "gateway":
+                    # A worker-only target is safe to resolve when that Gateway
+                    # Worker serves exactly one profile. Multiple profiles must
+                    # remain explicit so a task cannot run on the wrong route.
+                    if (
+                        candidate["target_worker_id"] != worker_id
+                        or len(route_rows) != 1
+                    ):
+                        continue
+                    route = route_rows[0]
+                elif worker["worker_kind"] == "unified":
+                    local_routes = [
+                        item
+                        for item in route_rows
+                        if not item["gateway_id"] and not item["profile"]
+                    ]
+                    gateway_routes = [
+                        item
+                        for item in route_rows
+                        if item["gateway_id"] and item["profile"]
+                    ]
+                    requested_agent = candidate["execution_agent"]
+                    selected_agent = canonical_agent_name(
+                        requested_agent or worker["default_agent"]
+                    )
+                    if selected_agent == "hermes":
+                        default_routes = [
+                            item
+                            for item in gateway_routes
+                            if json.loads(item["labels_json"]).get("default")
+                            in (True, "true", "1")
+                            and self._route_supports_agent(item, "hermes")
+                        ]
+                        eligible_routes = [
+                            item
+                            for item in gateway_routes
+                            if self._route_supports_agent(item, "hermes")
+                        ]
+                        if len(default_routes) == 1:
+                            route = default_routes[0]
+                        elif len(eligible_routes) == 1:
+                            route = eligible_routes[0]
+                        else:
+                            # A generic Hermes task must never pick an
+                            # arbitrary profile when the Worker serves more
+                            # than one Gateway route.
+                            continue
+                    elif len(local_routes) == 1:
+                        route = local_routes[0]
                 if candidate["execution_agent"] is not None:
                     agent = candidate["execution_agent"]
                     if route:
-                        supported = set(json.loads(route["supported_agents_json"]))
-                        if agent not in supported and f"agent:{agent}" not in supported:
+                        if not self._route_supports_agent(route, agent):
                             continue
-                    elif (
-                        agent not in capabilities
-                        and f"agent:{agent}" not in capabilities
-                    ):
+                    elif not self._capabilities_support_agent(capabilities, agent):
                         continue
                 selected = (candidate, route)
                 break
@@ -881,12 +991,18 @@ class SQLiteStore:
                 connection.commit()
                 return None
             claim_token = uuid.uuid4().hex
+            resolved_execution_agent = canonical_agent_name(
+                row["resolved_execution_agent"]
+                or row["execution_agent"]
+                or (route["default_agent"] if route else worker["default_agent"])
+            )
             if row["status"] == TaskStatus.RECONCILING.value:
                 cursor = connection.execute(
                     """
                     UPDATE tasks SET status = ?, claimed_by = ?, claim_token = ?,
                         lease_expires_at = ?,
-                        updated_at = ?, current_phase = ?, last_progress_at = ?,
+                        updated_at = ?, resolved_execution_agent = ?,
+                        current_phase = ?, last_progress_at = ?,
                         reconciliation_next_attempt_at = NULL
                     WHERE id = ? AND status = ?
                     """,
@@ -896,6 +1012,7 @@ class SQLiteStore:
                         claim_token,
                         current + lease_seconds,
                         current,
+                        resolved_execution_agent,
                         "reconciling",
                         current,
                         row["id"],
@@ -930,10 +1047,7 @@ class SQLiteStore:
                         route["route_id"] if route else f"{worker_id}:command",
                         route["gateway_id"] if route else None,
                         route["profile"] if route else None,
-                        row["execution_agent"]
-                        or (
-                            route["default_agent"] if route else worker["default_agent"]
-                        ),
+                        resolved_execution_agent,
                         "claimed",
                         current,
                         row["id"],

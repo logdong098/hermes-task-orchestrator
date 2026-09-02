@@ -26,6 +26,7 @@ from .models import (
     WorkerRegistration,
     WorkerResponse,
     WorkerRouteResponse,
+    agent_names_match,
 )
 from .planner import PlannerRuntime, PlannerSettings
 from .security import verify_signature
@@ -166,37 +167,65 @@ def create_app(
     def with_routing_diagnostic(task: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(task)
         enriched["routing_diagnostic"] = None
-        if task.get("status") != "pending" or not task.get("target_gateway_id"):
+        if task.get("status") != "pending":
             return enriched
         routes = repository.list_routes(configured.worker_stale_seconds)
-        matching = [
-            route
-            for route in routes
-            if route.get("gateway_id") == task.get("target_gateway_id")
-            and (route.get("target_profile") or route.get("profile"))
-            == task.get("target_profile")
-        ]
-        if task.get("target_worker_id"):
+        target_worker_id = task.get("target_worker_id")
+        target_gateway_id = task.get("target_gateway_id")
+        target_profile = task.get("target_profile")
+        if target_gateway_id:
             matching = [
                 route
-                for route in matching
-                if route.get("worker_id") == task.get("target_worker_id")
+                for route in routes
+                if route.get("gateway_id") == target_gateway_id
+                and (route.get("target_profile") or route.get("profile"))
+                == target_profile
             ]
+            if target_worker_id:
+                matching = [
+                    route
+                    for route in matching
+                    if route.get("worker_id") == target_worker_id
+                ]
+        elif target_worker_id:
+            matching = [
+                route for route in routes if route.get("worker_id") == target_worker_id
+            ]
+        else:
+            return enriched
         if not matching:
-            enriched["routing_diagnostic"] = (
-                "no registered route matches the requested Gateway/Profile"
-            )
+            if target_gateway_id:
+                enriched["routing_diagnostic"] = (
+                    "no registered route matches the requested Gateway/Profile"
+                )
+            else:
+                enriched["routing_diagnostic"] = "target Worker has no registered route"
             return enriched
         online = [route for route in matching if route.get("status") == "online"]
         if not online:
-            enriched["routing_diagnostic"] = "matching route is offline"
+            enriched["routing_diagnostic"] = (
+                "matching route is offline"
+                if target_gateway_id
+                else "target Worker is offline"
+            )
             return enriched
         requested_agent = task.get("execution_agent")
         if requested_agent and not any(
-            requested_agent in route.get("supported_agents", []) for route in online
+            agent_names_match(
+                requested_agent,
+                item[6:] if item.startswith("agent:") else item,
+            )
+            for route in online
+            for item in route.get("supported_agents", [])
+            if isinstance(item, str)
         ):
             enriched["routing_diagnostic"] = (
                 "matching route does not support the requested execution agent"
+            )
+            return enriched
+        if not target_gateway_id and len(online) > 1:
+            enriched["routing_diagnostic"] = (
+                "target Gateway Worker serves multiple profiles; specify Gateway and Profile"
             )
             return enriched
         enriched["routing_diagnostic"] = (

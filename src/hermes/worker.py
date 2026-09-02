@@ -11,12 +11,25 @@ from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
-from .config import WorkerSettings
+from .config import GatewayWorkerSettings, UnifiedWorkerSettings, WorkerSettings
+from .models import canonical_agent_name
 from .security import compact_json, sign_request
 
 LOGGER = logging.getLogger("hermes.worker")
 MAX_CAPTURE_BYTES = 2_000_000
 TRUNCATION_MARKER = b"\n[output truncated by Hermes Worker]\n"
+CONTROL_SECRET_MARKERS = ("SECRET", "TOKEN", "KEY", "PASSWORD")
+
+
+def build_execution_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Remove Hermes control-plane secrets before starting an Agent process."""
+    environment = dict(base if base is not None else os.environ)
+    for key in list(environment):
+        if key.startswith("HERMES_") and any(
+            marker in key.upper() for marker in CONTROL_SECRET_MARKERS
+        ):
+            environment.pop(key, None)
+    return environment
 
 
 class WorkerAPI:
@@ -189,14 +202,18 @@ class WorkerRuntime:
             raise ValueError("HERMES_WORKER_ID is required")
         if not self.settings.shared_secret:
             raise ValueError("HERMES_WORKER_SHARED_SECRET is required")
-        if not self.settings.default_agent:
+        default_agent = canonical_agent_name(self.settings.default_agent)
+        if not default_agent:
             raise ValueError("default agent must not be empty")
-        commands = dict(self.settings.agent_commands)
+        commands = {
+            canonical_agent_name(agent): command
+            for agent, command in self.settings.agent_commands.items()
+        }
         if not commands:
-            commands[self.settings.default_agent] = self.settings.command
-        elif self.settings.default_agent not in commands:
+            commands[default_agent] = self.settings.command
+        elif default_agent not in commands:
             # HERMES_WORKER_COMMAND remains the fallback for the default agent.
-            commands[self.settings.default_agent] = self.settings.command
+            commands[default_agent] = self.settings.command
         for agent, command in commands.items():
             if not agent or not command:
                 raise ValueError("agent commands must have non-empty names and argv")
@@ -227,18 +244,22 @@ class WorkerRuntime:
         return candidate
 
     def command_for(self, prompt: str, agent: Optional[str] = None) -> List[str]:
-        selected_agent = agent or self.settings.default_agent
-        command = self.settings.agent_commands.get(selected_agent)
+        selected_agent = canonical_agent_name(agent or self.settings.default_agent)
+        commands = {
+            canonical_agent_name(configured_agent): configured_command
+            for configured_agent, configured_command in self.settings.agent_commands.items()
+        }
+        command = commands.get(selected_agent)
         if command is None:
-            if selected_agent == self.settings.default_agent:
+            if selected_agent == canonical_agent_name(self.settings.default_agent):
                 command = self.settings.command
             else:
                 raise ValueError(f"unknown execution agent: {selected_agent}")
         return [prompt if argument == "{prompt}" else argument for argument in command]
 
     def capabilities(self) -> List[str]:
-        agents = set(self.settings.agent_commands)
-        agents.add(self.settings.default_agent)
+        agents = {canonical_agent_name(agent) for agent in self.settings.agent_commands}
+        agents.add(canonical_agent_name(self.settings.default_agent))
         return [f"agent:{agent}" for agent in sorted(agents)]
 
     async def _progress(
@@ -316,7 +337,7 @@ class WorkerRuntime:
                 cwd=str(workdir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
+                env=build_execution_env(),
                 **process_options,
             )
             self.processes[task_id] = process
@@ -491,6 +512,203 @@ class WorkerRuntime:
                 await asyncio.gather(*self.active.values(), return_exceptions=True)
 
 
+class UnifiedWorkerRuntime:
+    """One control loop that dispatches work to local or Gateway adapters."""
+
+    def __init__(
+        self, settings: UnifiedWorkerSettings, api: WorkerAPI, gateway: Any = None
+    ) -> None:
+        self.settings = settings
+        self.api = api
+        self.gateway = gateway
+        self.active: Dict[str, asyncio.Task[None]] = {}
+        self.claim_tokens: Dict[str, str] = {}
+        self.cancelled: Set[str] = set()
+        self.stopping = asyncio.Event()
+        self.process_runtime = WorkerRuntime(settings, api)
+        self.gateway_runtime = None
+        if gateway is not None:
+            # Keep the legacy GatewayWorker as the Hermes adapter until its
+            # execution methods are moved to a standalone adapter module.
+            from .gateway_worker import GatewayWorker
+
+            gateway_settings = GatewayWorkerSettings(
+                coordinator_url=settings.coordinator_url,
+                worker_id=settings.worker_id,
+                worker_name=settings.worker_name,
+                shared_secret=settings.shared_secret,
+                gateway_url=settings.gateway_url,
+                gateway_id=settings.gateway_id,
+                gateway_kind=settings.gateway_kind,
+                gateway_token=settings.gateway_token,
+                profile_keys=settings.profile_keys,
+                profiles=settings.profiles,
+                default_profile=settings.default_profile,
+                default_agent="hermes",
+                concurrency=settings.concurrency,
+                task_timeout_seconds=settings.task_timeout_seconds,
+                heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+                poll_interval_seconds=settings.poll_interval_seconds,
+                gateway_poll_interval_seconds=settings.gateway_poll_interval_seconds,
+                gateway_request_timeout_seconds=settings.gateway_request_timeout_seconds,
+                gateway_stop_wait_seconds=settings.gateway_stop_wait_seconds,
+            )
+            self.gateway_runtime = GatewayWorker(gateway_settings, api, gateway)
+        self._share_runtime_state()
+        self._validate_settings()
+
+    def _share_runtime_state(self) -> None:
+        self.process_runtime.active = self.active
+        self.process_runtime.claim_tokens = self.claim_tokens
+        self.process_runtime.cancelled = self.cancelled
+        self.process_runtime.stopping = self.stopping
+        if self.gateway_runtime is not None:
+            self.gateway_runtime.active = self.active
+            self.gateway_runtime.claim_tokens = self.claim_tokens
+            self.gateway_runtime.cancelled = self.cancelled
+            self.gateway_runtime.stopping = self.stopping
+
+    def _validate_settings(self) -> None:
+        if canonical_agent_name(self.settings.default_agent) == "hermes" and (
+            self.gateway_runtime is None
+        ):
+            raise ValueError("Hermes execution requires Gateway configuration")
+        if self.gateway_runtime is not None and not self.settings.gateway_id:
+            raise ValueError("Gateway configuration requires a gateway id")
+
+    def capabilities(self) -> List[str]:
+        capabilities = set(self.process_runtime.capabilities())
+        if self.gateway_runtime is not None:
+            capabilities.add("agent:hermes")
+        else:
+            capabilities.discard("agent:hermes")
+        return sorted(capabilities)
+
+    async def run_task(self, task: Dict[str, Any]) -> None:
+        agent = canonical_agent_name(
+            task.get("resolved_execution_agent")
+            or task.get("execution_agent")
+            or self.settings.default_agent
+        )
+        if agent == "hermes":
+            if self.gateway_runtime is None:
+                task_id = task["id"]
+                await self.api.report(
+                    task_id,
+                    task["claim_token"],
+                    "failed",
+                    error="Hermes execution is not configured on this Worker",
+                    retryable=False,
+                )
+                return
+            await self.gateway_runtime.run_task(task)
+            return
+        await self.process_runtime.run_task(task)
+
+    async def cancel_task(self, task_id: str) -> None:
+        self.cancelled.add(task_id)
+        await self.process_runtime._terminate_process(task_id)
+
+    async def heartbeat_loop(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                running_claims = [
+                    {"task_id": task_id, "claim_token": claim_token}
+                    for task_id, claim_token in self.claim_tokens.items()
+                    if task_id in self.active
+                ]
+                cancel_task_ids = await self.api.heartbeat(running_claims)
+                for task_id in cancel_task_ids:
+                    await self.cancel_task(task_id)
+            except Exception:
+                LOGGER.exception("heartbeat failed")
+            try:
+                await asyncio.wait_for(
+                    self.stopping.wait(),
+                    timeout=self.settings.heartbeat_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    def _task_done(self, task_id: str, _: asyncio.Task[None]) -> None:
+        self.active.pop(task_id, None)
+        self.claim_tokens.pop(task_id, None)
+
+    async def _gateway_routes(self) -> List[Dict[str, Any]]:
+        if self.gateway_runtime is None:
+            return []
+        profiles = self.settings.profiles or await self.gateway.discover_profiles()
+        profiles = list(
+            dict.fromkeys(profile.strip() for profile in profiles if profile.strip())
+        )
+        if not profiles:
+            raise ValueError("Unified Worker requires at least one Gateway profile")
+        routes = []
+        for profile in profiles:
+            routes.append(
+                {
+                    "route_id": f"{self.settings.gateway_id}:{profile}",
+                    "gateway_id": self.settings.gateway_id,
+                    "profile": profile,
+                    "target_profile": profile,
+                    "gateway_kind": self.settings.gateway_kind,
+                    "supported_agents": ["hermes"],
+                    "default_agent": "hermes",
+                    "labels": {
+                        "default": "true"
+                        if profile == self.settings.default_profile
+                        else "false"
+                    },
+                }
+            )
+        return routes
+
+    async def run(self, once: bool = False) -> None:
+        routes = await self._gateway_routes()
+        await self.api.register(
+            self.settings.worker_name,
+            self.settings.concurrency,
+            capabilities=self.capabilities(),
+            metadata={
+                "worker_kind": "unified",
+                "default_agent": self.settings.default_agent,
+                "gateway_id": self.settings.gateway_id or None,
+                "profiles": [route["profile"] for route in routes],
+            },
+            worker_kind="unified",
+            default_agent=self.settings.default_agent,
+            routes=routes,
+        )
+        LOGGER.info("unified worker %s registered", self.settings.worker_id)
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        try:
+            while not self.stopping.is_set():
+                claimed_any = False
+                while len(self.active) < self.settings.concurrency:
+                    task = await self.api.claim()
+                    if task is None:
+                        break
+                    claimed_any = True
+                    task_id = task["id"]
+                    self.claim_tokens[task_id] = task["claim_token"]
+                    running = asyncio.create_task(self.run_task(task))
+                    self.active[task_id] = running
+                    running.add_done_callback(
+                        lambda done, identifier=task_id: self._task_done(
+                            identifier, done
+                        )
+                    )
+                if once and not self.active and not claimed_any:
+                    break
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+        finally:
+            self.stopping.set()
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if self.active:
+                await asyncio.gather(*self.active.values(), return_exceptions=True)
+
+
 async def run_worker(settings: WorkerSettings, once: bool = False) -> None:
     api = WorkerAPI(
         settings.coordinator_url,
@@ -504,6 +722,32 @@ async def run_worker(settings: WorkerSettings, once: bool = False) -> None:
         await api.close()
 
 
+async def run_unified_worker(
+    settings: UnifiedWorkerSettings, once: bool = False
+) -> None:
+    from .gateway_adapter import GatewayAdapter
+
+    api = WorkerAPI(
+        settings.coordinator_url, settings.worker_id, settings.shared_secret
+    )
+    gateway = None
+    if settings.gateway_enabled and settings.gateway_url and settings.gateway_id:
+        gateway = GatewayAdapter(
+            settings.gateway_url,
+            settings.gateway_token,
+            settings.profile_keys,
+            default_profile=settings.default_profile,
+            configured_profiles=settings.profiles,
+            timeout=settings.gateway_request_timeout_seconds,
+        )
+    try:
+        await UnifiedWorkerRuntime(settings, api, gateway).run(once=once)
+    finally:
+        await api.close()
+        if gateway is not None:
+            await gateway.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a Hermes Worker")
     parser.add_argument(
@@ -515,7 +759,9 @@ def main() -> None:
         level=getattr(logging, arguments.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    asyncio.run(run_worker(WorkerSettings.from_env(), once=arguments.once))
+    asyncio.run(
+        run_unified_worker(UnifiedWorkerSettings.from_env(), once=arguments.once)
+    )
 
 
 if __name__ == "__main__":

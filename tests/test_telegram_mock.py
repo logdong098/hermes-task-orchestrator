@@ -142,8 +142,8 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         created = await self.bot.handle_text(
             "/new --agent claude implement feature", 42, 100
         )
-        self.assertIn("执行 Agent：claude", created)
-        self.assertEqual("claude", self.director.created[-1][4])
+        self.assertIn("执行 Agent：claude-code", created)
+        self.assertEqual("claude-code", self.director.created[-1][4])
 
     async def test_gateway_and_profile_must_be_paired(self) -> None:
         before = len(self.director.created)
@@ -169,7 +169,47 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("直接执行", response)
         self.assertEqual("fix login failure", self.director.created[-1][0])
         self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertIsNone(self.director.created[-1][4])
         self.assertEqual("direct", self.director.created[-1][8])
+
+    async def test_worker_shorthand_dispatches_without_worker_id(self) -> None:
+        response = await self.bot.handle_text("@worker fix login failure", 42, 100)
+        self.assertIn("直接执行", response)
+        self.assertEqual("fix login failure", self.director.created[-1][0])
+        self.assertIsNone(self.director.created[-1][5])
+        self.assertEqual("direct", self.director.created[-1][8])
+
+    async def test_worker_mention_preserves_execution_agent(self) -> None:
+        response = await self.bot.handle_text(
+            "@worker-a --executor claude fix login failure", 42, 100
+        )
+        self.assertIn("执行 Agent：claude-code", response)
+        self.assertEqual("fix login failure", self.director.created[-1][0])
+        self.assertEqual("claude-code", self.director.created[-1][4])
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("direct", self.director.created[-1][8])
+
+    async def test_worker_mention_accepts_agent_compatibility_alias(self) -> None:
+        await self.bot.handle_text(
+            "@worker-a --agent claude fix login failure", 42, 100
+        )
+        self.assertEqual("claude-code", self.director.created[-1][4])
+
+    async def test_worker_mention_accepts_short_codex_override(self) -> None:
+        await self.bot.handle_text("@worker-a -codex fix login failure", 42, 100)
+        self.assertEqual("codex", self.director.created[-1][4])
+
+    async def test_worker_mention_accepts_short_claude_code_override(self) -> None:
+        await self.bot.handle_text("@worker-a -cc fix login failure", 42, 100)
+        self.assertEqual("claude-code", self.director.created[-1][4])
+
+    async def test_worker_mention_rejects_duplicate_agent_overrides(self) -> None:
+        before = len(self.director.created)
+        response = await self.bot.handle_text(
+            "@worker-a -cc --executor codex fix login failure", 42, 100
+        )
+        self.assertIn("只能指定一次", response)
+        self.assertEqual(before, len(self.director.created))
 
     async def test_coordinator_and_worker_mentions_create_planned_task(self) -> None:
         response = await self.bot.handle_text(
@@ -177,6 +217,17 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("先规划后执行", response)
         self.assertEqual("analyze then implement", self.director.created[-1][0])
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("plan", self.director.created[-1][8])
+
+    async def test_planned_worker_mention_preserves_execution_agent(self) -> None:
+        await self.bot.handle_text(
+            "@worker-a @Coordinator --executor claude analyze then implement",
+            42,
+            100,
+        )
+        self.assertEqual("analyze then implement", self.director.created[-1][0])
+        self.assertEqual("claude-code", self.director.created[-1][4])
         self.assertEqual("worker-a", self.director.created[-1][5])
         self.assertEqual("plan", self.director.created[-1][8])
 

@@ -62,22 +62,26 @@ Coordinator 是唯一控制平面。Worker 主动向 Coordinator 发起出站连
 
 ### Worker
 
+- `hermes-worker` 是唯一推荐的运行进程，内部按 Agent 选择执行适配器：`hermes` 走 Gateway，`codex` 与 `claude-code` 走本机 CLI。
 - 使用稳定 `worker_id` 注册并周期心跳。
 - 注册 `agent:<name>` 能力，并根据本地并发空位主动领取兼容任务。
-- 将任务标记为 `running` 后，以 `create_subprocess_exec` 启动固定命令模板。
+- 将任务标记为 `running` 后，按 `resolved_execution_agent` 选择 Gateway 或固定命令模板。
 - 只把 `{prompt}` 作为单独参数替换，不经过 shell 解释。
 - 验证工作目录必须位于允许根目录内。
-- 本地实施超时；收到取消列表后终止或杀死子进程。
+- 本地 CLI 实施超时并在取消时终止/杀死子进程；Gateway 执行保留远端停止确认和对账。
 - 捕获 stdout/stderr，限制单路最大 2 MB，并回传终态。
+- 启动本地 Agent 子进程前移除 `HERMES_*` 控制面密钥，避免 Worker/Gateway/Director 凭据泄露。
 
-### Gateway-aware Worker（M1）
+### Hermes Gateway Adapter（M1）
 
-这是独立的无 GUI 进程（`python -m hermes.gateway_worker`），不是 Desktop 插件：
+Gateway 是 Unified Worker 内部的执行适配器，不是第二个必需进程；`hermes-gateway-worker` 仅作为旧部署的兼容入口：
 
 - 启动时从 Hermes API Server（默认 `http://127.0.0.1:8642`）发现或读取 Profile 列表，并为每个 Profile 注册独立 Coordinator route；共享 `/p/<profile>/...` 监听要求启用 `gateway.multiplex_profiles`，且每个命名 Profile 必须在自己的 `.env` 配置独立 `API_SERVER_KEY`。
 - 每次执行都使用 Coordinator 返回的 `resolved_gateway_id/resolved_profile`，不会按当前 Desktop 前台连接或 profile-only 名称猜测路由。
 - 每个 Profile 可使用独立 API key（`HERMES_GATEWAY_PROFILE_KEYS_JSON`）；凭据只在 Worker 主机注入。
-- 通过 Hermes Runs API 创建、轮询、停止和基本恢复；Coordinator 的 lease/attempt 仍是唯一重试依据。
+- 通过 Hermes Runs API 创建、轮询、停止和重启后的 reconciliation；Coordinator 的 lease/attempt 仍是唯一重试依据。
+
+Codex/Claude Code 本地进程属于非持久执行：Worker 崩溃后不尝试用 PID 恢复原进程，而是等待 Coordinator 租约过期后按普通重试处理。Hermes 已创建的远端 run 则使用持久化的 `remote_run_id` 对账，不创建重复 run。
 
 M0/M1 不包含 Desktop Fleet Plugin、Desktop Proxy Executor 或跨 Gateway delegation；这些属于后续 M2/M4。Desktop 可关闭，生产任务仍应由后台 Worker 完成。
 
@@ -120,7 +124,7 @@ Director + Coordinator（中心节点）
 
 Compose 默认只启动 Coordinator。`worker` 和 `telegram` 通过 profile 选择启用。真实 Worker 常在宿主机运行，以访问本机 Hermes 与工程目录；容器 Worker 示例默认运行 mock。
 
-M1 的 `gateway-worker` Compose profile 通过 `host.docker.internal:8642` 访问宿主机 Hermes API Server，仅适合开发或受控 Docker 网络。生产部署优先在 Gateway 宿主机直接运行，以保留 OS keychain、SSH agent 和本地凭据边界；Desktop 不在 readiness chain 中。
+M1 的 Unified Worker 通过 `host.docker.internal:8642` 访问宿主机 Hermes API Server，仅适合开发或受控 Docker 网络。生产部署优先在 Gateway 宿主机直接运行，以保留 OS keychain、SSH agent 和本地凭据边界；Desktop 不在 readiness chain 中。
 
 ## 6. 任务生命周期
 
@@ -129,7 +133,7 @@ M1 的 `gateway-worker` Compose profile 通过 `host.docker.internal:8642` 访�
 3. `plan` 模式下 Coordinator 领取本地规划租约，调用所选 Claude/Codex Planner。
 4. 规划成功后持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`；`direct` 模式跳过这两步。
 5. 有空闲容量且兼容 `execution_agent` 的 Worker 发起 claim；若该字段为空则 Worker 使用自身默认 Agent。
-6. Worker 回报 `running`，启动本机 Agent 子进程。
+6. Worker 回报 `running`，由 `resolved_execution_agent` 对应的适配器启动本机 Agent 子进程或 Hermes Gateway run。
 7. 心跳持续续租；Coordinator 同时返回待取消任务 ID。
 8. Worker 回传终态，Coordinator 持久化结果并写入可选通知 outbox。
 
@@ -142,7 +146,7 @@ Worker 注册字段：
 | `worker_id` | 稳定且唯一的机器/实例标识 |
 | `name` | 人类可读名称 |
 | `max_concurrency` | Coordinator 允许该 Worker 同时持有的任务数 |
-| `capabilities` | `agent:<name>` 列表，用于显式执行 Agent 的兼容领取 |
+| `capabilities` | `agent:<name>` 列表，用于显式执行 Agent 的兼容领取；Unified Worker 可同时声明本地 Agent 与 `hermes` |
 | `metadata` | 平台、Python 版本和 `default_agent` 等非敏感信息 |
 
 重复注册采用 upsert，可用于进程重启。`registered_at` 保留首次时间，`last_heartbeat_at` 更新。
@@ -155,6 +159,8 @@ Worker 注册字段：
 - 不信任 Worker 对其他 Worker 任务的声明。
 
 `last_heartbeat_at` 超过 `worker_stale_seconds` 后，查询结果显示 Worker 为 `offline`。在线状态是派生值，不单独持久化。
+
+Unified Worker 的 Gateway route 只执行对应 route 支持的 `hermes`；Codex/Claude Code 则走同一 Worker 内的本地命令适配器。旧 `gateway-worker` 入口仍可用于迁移，但不再代表一套独立的控制环。
 
 ## 8. 任务协议
 
@@ -258,14 +264,16 @@ Telegram 进程轮询未 ACK 通知，发送成功后再 ACK。因此交付语�
 | `/agents` | 列出 Worker ID、在线状态和并发 |
 | `/tasks` | 列出最近任务、状态、当前阶段和 Worker |
 | `/new [--planner claude|codex] [--agent <agent>] <任务>` | 创建任务并可指定两阶段 Agent |
-| `@worker-a <任务>` | 跳过 Planner，定向指定 Worker 执行 |
-| `@Coordinator [@worker-a] <任务>` | 先规划，再自动或定向执行 |
+| `@worker-a [-codex\|-cc\|--executor/--agent <agent>] <任务>` | 跳过 Planner，按默认或显式 Agent 定向执行 |
+| `@Coordinator [@worker-a] [-codex\|-cc\|--executor/--agent <agent>] <任务>` | 先规划，再自动或定向执行 |
 | `/status <UUID>` | 查询模式、阶段、attempt、事件和结果/错误 |
 | `/cancel <UUID>` | 请求取消 |
 | `/help` | 显示命令帮助 |
 | 普通文本 | 等价于 `/new <文本>` |
 
 只有 `HERMES_TELEGRAM_ALLOWED_USER_IDS` 中的用户可调用。命令支持群聊中的 `/command@botname` 形式。输出按 4000 字符分片，低于 Telegram 单消息上限。
+
+`@worker <任务>` 让 Coordinator 选择在线 Worker（单 Worker 部署时就是唯一的 Unified Worker）；写成 `@worker-a` 则定向到具体 Worker ID。未指定 Agent 时使用 Worker 的 `default_agent`；`-codex` 和 `-cc` 只在 Worker mention 后的选项区生效，分别映射为 `codex` 和 `claude-code`。旧的 `--executor`/`--agent` 仍兼容；不支持的 Agent 不会静默 fallback。
 
 ## 13. 权限与安全
 
@@ -390,9 +398,12 @@ Worker API 使用前述 HMAC Header。任务领取响应包含当前 claim token
 
 - `HERMES_COORDINATOR_URL`、`HERMES_WORKER_ID/NAME`。
 - `HERMES_WORKER_SHARED_SECRET`：必须与 Coordinator 一致。
-- `HERMES_WORKER_COMMAND`：默认 `hermes chat -q {prompt}`；必须包含独立 `{prompt}` 参数。
+- `HERMES_WORKER_DEFAULT_AGENT`：未指定任务 Agent 时使用的默认值；新部署建议为 `hermes`。
+- `HERMES_WORKER_AGENTS_JSON`：Codex/Claude Code 等本地 Agent 的 argv 模板；必须包含独立 `{prompt}` 参数。`HERMES_AGENT_COMMANDS` 是兼容别名。
+- `HERMES_WORKER_COMMAND`：默认 `hermes chat -q {prompt}` 的兼容配置；Unified Worker 的 Hermes 任务实际使用 Gateway。
 - `HERMES_WORKER_ALLOWED_WORKDIR`：允许根目录。
 - `HERMES_WORKER_CONCURRENCY`、本地超时、心跳和轮询间隔。
+- `HERMES_GATEWAY_URL/ID/PROFILES`：Unified Worker 的 Hermes Gateway 路由配置；每个 Profile 的 key 只保存在 Worker 主机。
 
 ### Telegram 关键配置
 
@@ -421,11 +432,13 @@ Worker API 使用前述 HMAC Header。任务领取响应包含当前 claim token
 3. 设置 Telegram Token/allowlist 后启用 `--profile telegram`。
 4. 将 Coordinator 放到 TLS/VPN 后，并持久化 `hermes-data` volume。
 
-### Gateway Worker 安装与远程安全
+### Unified Worker 安装与远程安全
 
-Gateway 所在机器安装项目和依赖后，配置 `HERMES_COORDINATOR_URL`、唯一的 `HERMES_GATEWAY_WORKER_ID`、`HERMES_GATEWAY_ID`、`HERMES_GATEWAY_URL`、`HERMES_GATEWAY_PROFILES` 与 profile keys，再运行 `python -m hermes.gateway_worker`。Hermes API Server 默认端口为 `8642`；跨主机时使用 Tailscale/WireGuard 私网地址或 HTTPS/SSH 转发，禁止将 8642 直接暴露到公网。Coordinator 只接收 Worker HMAC 和 route 元数据，不接触 Gateway key。
+Worker 所在机器安装项目和依赖后，配置 `HERMES_COORDINATOR_URL`、唯一的 `HERMES_WORKER_ID`、`HERMES_GATEWAY_ID`、`HERMES_GATEWAY_URL`、`HERMES_GATEWAY_PROFILES` 与 profile keys，再运行 `python -m hermes.worker`。Hermes API Server 默认端口为 `8642`；跨主机时使用 Tailscale/WireGuard 私网地址或 HTTPS/SSH 转发，禁止将 8642 直接暴露到公网。Coordinator 只接收 Worker HMAC 和 route 元数据，不接触 Gateway key。
 
-建议分别用 systemd（Linux）或 launchd（macOS）托管 Coordinator、普通 Worker、Gateway Worker 和 Telegram。服务应使用独立低权限用户、独立工作目录和受限环境文件；key 不应写入 unit/plist、镜像或日志。
+`python -m hermes.gateway_worker` 仍作为旧配置的兼容入口，内部转交 Unified Worker；新部署不要同时启动两个入口使用同一个 Worker ID。
+
+建议分别用 systemd（Linux）或 launchd（macOS）托管 Coordinator、Unified Worker 和 Telegram。服务应使用独立低权限用户、独立工作目录和受限环境文件；key 不应写入 unit/plist、镜像或日志。
 
 SQLite 升级只执行 additive migration。升级前停止 Coordinator 或使用 `sqlite3 <db> ".backup '<copy>'"` 在线备份；恢复时先停止服务，不能只复制正在使用的主 `.db` 而忽略 WAL 文件。Compose 的 `hermes-data` volume 也应在升级前导出并定期验证恢复。
 

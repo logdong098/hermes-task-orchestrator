@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .models import canonical_agent_name
+
 
 def load_env_file(path: Optional[str] = None) -> None:
     env_path = Path(path or os.getenv("HERMES_ENV_FILE", ".env"))
@@ -81,6 +83,29 @@ def _default_planner_commands() -> Dict[str, List[str]]:
         "claude": ["claude", "--permission-mode", "plan", "-p", "{prompt}"],
         "codex": ["codex", "exec", "--sandbox", "read-only", "{prompt}"],
     }
+
+
+def _default_execution_commands() -> Dict[str, List[str]]:
+    """Commands used by the unified worker when no override is supplied."""
+    return {
+        "codex": ["codex", "exec", "{prompt}"],
+        "claude-code": ["claude", "-p", "{prompt}"],
+    }
+
+
+def _canonical_agent_commands(
+    commands: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    canonical: Dict[str, List[str]] = {}
+    for agent, command in commands.items():
+        canonical[canonical_agent_name(agent)] = command
+    return canonical
+
+
+def _has_nonempty_env_prefix(prefix: str) -> bool:
+    return any(
+        key.startswith(prefix) and value.strip() for key, value in os.environ.items()
+    )
 
 
 @dataclass(frozen=True)
@@ -181,6 +206,10 @@ class WorkerSettings:
             os.getenv("HERMES_WORKER_COMMAND", "hermes chat -q {prompt}")
         )
         agent_commands = _json_agent_commands("HERMES_WORKER_AGENTS_JSON")
+        if not agent_commands:
+            # Keep the short name accepted by earlier worker deployments.  The
+            # JSON shape is the same as HERMES_WORKER_AGENTS_JSON.
+            agent_commands = _json_agent_commands("HERMES_AGENT_COMMANDS")
         return cls(
             coordinator_url=os.getenv(
                 "HERMES_COORDINATOR_URL", "http://127.0.0.1:8000"
@@ -198,6 +227,109 @@ class WorkerSettings:
                 "HERMES_WORKER_HEARTBEAT_INTERVAL_SECONDS", 10
             ),
             poll_interval_seconds=_int("HERMES_WORKER_POLL_INTERVAL_SECONDS", 2),
+        )
+
+
+@dataclass(frozen=True)
+class UnifiedWorkerSettings(WorkerSettings):
+    """Configuration for the single Worker that serves all execution agents."""
+
+    gateway_url: str = "http://127.0.0.1:8642"
+    gateway_id: str = ""
+    gateway_kind: str = "local"
+    gateway_token: str = ""
+    profile_keys: Dict[str, str] = field(default_factory=dict)
+    profiles: List[str] = field(default_factory=list)
+    default_profile: str = "default"
+    gateway_poll_interval_seconds: float = 2.0
+    gateway_request_timeout_seconds: float = 30.0
+    gateway_stop_wait_seconds: float = 30.0
+    gateway_enabled: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.gateway_enabled is None:
+            object.__setattr__(
+                self,
+                "gateway_enabled",
+                canonical_agent_name(self.default_agent) == "hermes"
+                or bool(self.gateway_id)
+                or bool(self.profiles),
+            )
+
+    @classmethod
+    def from_env(cls) -> "UnifiedWorkerSettings":
+        import socket
+
+        load_env_file()
+        hostname = socket.gethostname()
+        worker_id = os.getenv("HERMES_WORKER_ID", hostname)
+        command = shlex.split(
+            os.getenv("HERMES_WORKER_COMMAND", "hermes chat -q {prompt}")
+        )
+        configured_commands = _json_agent_commands("HERMES_WORKER_AGENTS_JSON")
+        if not configured_commands:
+            configured_commands = _json_agent_commands("HERMES_AGENT_COMMANDS")
+        configured_default_agent = os.getenv("HERMES_WORKER_DEFAULT_AGENT")
+        gateway_configured = _has_nonempty_env_prefix("HERMES_GATEWAY_")
+        legacy_command_mode = (
+            configured_default_agent is None and not gateway_configured
+        )
+        if legacy_command_mode:
+            # Before Unified Worker, hermes-worker treated HERMES_WORKER_COMMAND
+            # as its default command and did not require a Gateway. Preserve
+            # that behavior when an old environment has no new routing signal.
+            default_agent = "default"
+            agent_commands = _canonical_agent_commands(configured_commands)
+            gateway_id = ""
+            gateway_enabled = False
+        else:
+            agent_commands = _default_execution_commands()
+            agent_commands.update(_canonical_agent_commands(configured_commands))
+            agent_commands["hermes"] = command
+            default_agent = canonical_agent_name(configured_default_agent or "hermes")
+            gateway_id = os.getenv("HERMES_GATEWAY_ID", hostname)
+            gateway_enabled = default_agent == "hermes" or gateway_configured
+        profiles = [
+            item.strip()
+            for item in os.getenv("HERMES_GATEWAY_PROFILES", "").split(",")
+            if item.strip()
+        ]
+        return cls(
+            coordinator_url=os.getenv(
+                "HERMES_COORDINATOR_URL", "http://127.0.0.1:8000"
+            ).rstrip("/"),
+            worker_id=worker_id,
+            worker_name=os.getenv("HERMES_WORKER_NAME", hostname),
+            shared_secret=os.getenv("HERMES_WORKER_SHARED_SECRET", ""),
+            command=command,
+            default_agent=default_agent,
+            agent_commands=agent_commands,
+            allowed_workdir=os.getenv("HERMES_WORKER_ALLOWED_WORKDIR", "."),
+            concurrency=_int("HERMES_WORKER_CONCURRENCY", 1),
+            task_timeout_seconds=_int("HERMES_WORKER_TASK_TIMEOUT_SECONDS", 900),
+            heartbeat_interval_seconds=_int(
+                "HERMES_WORKER_HEARTBEAT_INTERVAL_SECONDS", 10
+            ),
+            poll_interval_seconds=_float("HERMES_WORKER_POLL_INTERVAL_SECONDS", 2.0),
+            gateway_url=os.getenv("HERMES_GATEWAY_URL", "http://127.0.0.1:8642").rstrip(
+                "/"
+            ),
+            gateway_id=gateway_id,
+            gateway_kind=os.getenv("HERMES_GATEWAY_KIND", "local").strip().lower(),
+            gateway_token=os.getenv("HERMES_GATEWAY_TOKEN", ""),
+            profile_keys=_json_dict("HERMES_GATEWAY_PROFILE_KEYS_JSON"),
+            profiles=profiles,
+            default_profile=os.getenv(
+                "HERMES_GATEWAY_DEFAULT_PROFILE", "default"
+            ).strip(),
+            gateway_poll_interval_seconds=_float(
+                "HERMES_GATEWAY_POLL_INTERVAL_SECONDS", 2.0
+            ),
+            gateway_request_timeout_seconds=_float(
+                "HERMES_GATEWAY_REQUEST_TIMEOUT_SECONDS", 30.0
+            ),
+            gateway_stop_wait_seconds=_float("HERMES_GATEWAY_STOP_WAIT_SECONDS", 30.0),
+            gateway_enabled=gateway_enabled,
         )
 
 
