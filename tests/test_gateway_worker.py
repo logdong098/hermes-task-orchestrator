@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
@@ -5,6 +6,7 @@ import httpx
 
 from hermes.config import GatewayWorkerSettings
 from hermes.gateway_worker import GatewayWorker
+from hermes.worker import WorkerNotRegisteredError
 
 
 class FakeAPI:
@@ -119,6 +121,22 @@ def task(**extra):
 
 
 class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_re_registers_after_registration_loss(self):
+        api = FakeAPI()
+        api.heartbeat = AsyncMock(
+            side_effect=WorkerNotRegisteredError("worker was evicted")
+        )
+        worker = GatewayWorker(settings(), api, FakeGateway([]))
+
+        async def stop() -> None:
+            await asyncio.sleep(0.01)
+            worker.stopping.set()
+
+        stopper = asyncio.create_task(stop())
+        await worker.heartbeat_loop()
+        await stopper
+        self.assertEqual(1, len(api.registrations))
+
     async def test_claim_read_timeout_does_not_stop_worker(self):
         api = FakeAPI()
         api.claim = AsyncMock(
@@ -127,6 +145,17 @@ class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         await GatewayWorker(settings(), api, FakeGateway([])).run(once=True)
 
+        self.assertEqual(2, api.claim.await_count)
+
+    async def test_claim_registration_loss_re_registers_without_stopping_worker(self):
+        api = FakeAPI()
+        api.claim = AsyncMock(
+            side_effect=[WorkerNotRegisteredError("worker was evicted"), None]
+        )
+
+        await GatewayWorker(settings(), api, FakeGateway([])).run(once=True)
+
+        self.assertEqual(2, len(api.registrations))
         self.assertEqual(2, api.claim.await_count)
 
     async def test_registers_structured_remote_routes(self):

@@ -158,7 +158,7 @@ Worker 注册字段：
 - 返回处于 `cancel_requested` 的任务 ID；
 - 不信任 Worker 对其他 Worker 任务的声明。
 
-`last_heartbeat_at` 超过 `worker_stale_seconds` 后，查询结果显示 Worker 为 `offline`。在线状态是派生值，不单独持久化。
+`last_heartbeat_at` 超过 `worker_stale_seconds` 后，查询结果显示 Worker 为 `offline`。在线状态是派生值，不单独持久化。持续离线超过独立的 `worker_eviction_seconds` 后，Coordinator 在 maintenance 事务中设置 tombstone、移除其 routes，并从活跃注册表隐藏；Worker 行和任务历史归属保留。收到 heartbeat 404 的存活 Worker 会重新注册并恢复 routes，普通网络或认证错误不会触发重新注册。
 
 Unified Worker 的 Gateway route 只执行对应 route 支持的 `hermes`；Codex/Claude Code 则走同一 Worker 内的本地命令适配器。旧 `gateway-worker` 入口仍可用于迁移，但不再代表一套独立的控制环。
 
@@ -388,6 +388,7 @@ Worker API 使用前述 HMAC Header。任务领取响应包含当前 claim token
 - `HERMES_WORKER_SHARED_SECRET`：Worker HMAC 共享密钥，必需。
 - `HERMES_WORKER_SECRETS_JSON`：可选的 Worker ID 到独立密钥 JSON 映射；设置后禁用共享回退。
 - `HERMES_WORKER_STALE_SECONDS`：Worker 离线判定阈值。
+- `HERMES_WORKER_EVICTION_SECONDS`：Worker 长期离线剔除阈值，必须大于 stale 阈值。
 - `HERMES_TASK_LEASE_SECONDS`：任务租约。
 - `HERMES_HMAC_MAX_CLOCK_SKEW_SECONDS`：签名时间窗口。
 - `HERMES_DEFAULT/MAX_TASK_TIMEOUT_SECONDS`：任务默认/最大超时。

@@ -7,10 +7,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes.config import UnifiedWorkerSettings, WorkerSettings
+from hermes.config import CoordinatorSettings, UnifiedWorkerSettings, WorkerSettings
 
 
 class ConfigTests(unittest.TestCase):
+    def test_coordinator_worker_eviction_defaults_and_env_override(self) -> None:
+        self.assertEqual(900, CoordinatorSettings().worker_eviction_seconds)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
+                    "HERMES_WORKER_STALE_SECONDS": "60",
+                    "HERMES_WORKER_EVICTION_SECONDS": "1200",
+                },
+                clear=True,
+            ):
+                settings = CoordinatorSettings.from_env()
+
+        self.assertEqual(60, settings.worker_stale_seconds)
+        self.assertEqual(1200, settings.worker_eviction_seconds)
+
+    def test_coordinator_rejects_invalid_worker_lifecycle_thresholds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "worker_stale_seconds"):
+            CoordinatorSettings(worker_stale_seconds=0)
+        with self.assertRaisesRegex(ValueError, "worker_eviction_seconds"):
+            CoordinatorSettings(worker_stale_seconds=45, worker_eviction_seconds=45)
+
     def test_unified_settings_preserve_legacy_command_worker_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             with patch.dict(

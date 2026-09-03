@@ -9,7 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from hermes.models import TaskProgressUpdate
-from hermes.storage import ConflictError, SQLiteStore
+from hermes.storage import ConflictError, NotFoundError, SQLiteStore
 
 
 class SQLiteStoreTests(unittest.TestCase):
@@ -130,6 +130,82 @@ class SQLiteStoreTests(unittest.TestCase):
         statuses = {worker["worker_id"]: worker["status"] for worker in workers}
         self.assertEqual("online", statuses["worker-a"])
         self.assertEqual("offline", statuses["worker-b"])
+
+    def test_worker_eviction_is_separate_from_stale_status(self) -> None:
+        self.store.run_maintenance(now=145)
+        workers = self.store.list_workers(stale_seconds=45, now=146)
+        self.assertEqual(2, len(workers))
+        self.assertTrue(all(worker["status"] == "offline" for worker in workers))
+
+        self.store.run_maintenance(now=1000)
+        self.assertEqual(2, len(self.store.list_workers(stale_seconds=45, now=1000)))
+        self.store.run_maintenance(now=1001)
+        self.assertEqual([], self.store.list_workers(stale_seconds=45, now=1001))
+        self.assertEqual([], self.store.list_routes(stale_seconds=45, now=1001))
+
+        with self.store._connect() as connection:
+            rows = connection.execute(
+                "SELECT worker_id, evicted_at FROM workers ORDER BY worker_id"
+            ).fetchall()
+        self.assertEqual(["worker-a", "worker-b"], [row["worker_id"] for row in rows])
+        self.assertTrue(all(row["evicted_at"] == 1001 for row in rows))
+
+    def test_evicted_worker_can_reregister_without_losing_task_attribution(
+        self,
+    ) -> None:
+        task = self.create_task(max_attempts=1)
+        claimed = self.store.claim_task("worker-a", lease_seconds=30, now=101)
+        self.store.update_task_status(
+            task["id"],
+            "worker-a",
+            "running",
+            claim_token=claimed["claim_token"],
+            now=102,
+        )
+        self.store.report_result(
+            task["id"],
+            "worker-a",
+            "succeeded",
+            "done",
+            None,
+            False,
+            claim_token=claimed["claim_token"],
+            now=103,
+        )
+
+        self.store.run_maintenance(now=1001)
+        with self.assertRaises(NotFoundError):
+            self.store.heartbeat("worker-a", [], lease_seconds=30, now=1002)
+
+        with self.store._connect() as connection:
+            stored = connection.execute(
+                "SELECT evicted_at FROM workers WHERE worker_id = ?",
+                ("worker-a",),
+            ).fetchone()
+        self.assertEqual(1001, stored["evicted_at"])
+        self.assertEqual("worker-a", self.store.get_task(task["id"])["claimed_by"])
+
+        registered = self.store.register_worker(
+            {
+                "worker_id": "worker-a",
+                "name": "Worker A restarted",
+                "max_concurrency": 3,
+                "capabilities": ["hermes-chat", "agent:codex"],
+                "metadata": {"restart": True},
+            },
+            now=1002,
+        )
+        self.assertIsNone(registered["evicted_at"])
+        self.assertEqual("Worker A restarted", registered["name"])
+        self.store.heartbeat("worker-a", [], lease_seconds=30, now=1003)
+        self.assertEqual(
+            "online",
+            next(
+                worker
+                for worker in self.store.list_workers(stale_seconds=45, now=1003)
+                if worker["worker_id"] == "worker-a"
+            )["status"],
+        )
 
     def test_heartbeat_claim_token_fences_stale_runtime_from_new_attempt(self) -> None:
         task = self.create_task(max_attempts=2)

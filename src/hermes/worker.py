@@ -22,6 +22,10 @@ TRUNCATION_MARKER = b"\n[output truncated by Hermes Worker]\n"
 CONTROL_SECRET_MARKERS = ("SECRET", "TOKEN", "KEY", "PASSWORD")
 
 
+class WorkerNotRegisteredError(RuntimeError):
+    """The Coordinator no longer has an active registration for this worker."""
+
+
 def build_execution_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Remove Hermes control-plane secrets before starting an Agent process."""
     environment = dict(base if base is not None else os.environ)
@@ -119,18 +123,32 @@ class WorkerAPI:
         )
 
     async def heartbeat(self, running_claims: List[Dict[str, str]]) -> List[str]:
-        response = await self._request(
-            "POST",
-            f"/api/v1/workers/{self.worker_id}/heartbeat",
-            {"running_claims": running_claims},
-        )
+        try:
+            response = await self._request(
+                "POST",
+                f"/api/v1/workers/{self.worker_id}/heartbeat",
+                {"running_claims": running_claims},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise WorkerNotRegisteredError(
+                    f"worker {self.worker_id} is no longer registered"
+                ) from exc
+            raise
         return response.get("cancel_task_ids", [])
 
     async def claim(self) -> Optional[Dict[str, Any]]:
-        response = await self._request(
-            "POST",
-            f"/api/v1/workers/{self.worker_id}/tasks/claim",
-        )
+        try:
+            response = await self._request(
+                "POST",
+                f"/api/v1/workers/{self.worker_id}/tasks/claim",
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise WorkerNotRegisteredError(
+                    f"worker {self.worker_id} is no longer registered"
+                ) from exc
+            raise
         return response.get("task")
 
     async def set_running(self, task_id: str, claim_token: str) -> Dict[str, Any]:
@@ -210,6 +228,7 @@ class WorkerRuntime:
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self.cancelled: Set[str] = set()
         self.stopping = asyncio.Event()
+        self._registration_lock = asyncio.Lock()
         self._validate_settings()
 
     def _validate_settings(self) -> None:
@@ -276,6 +295,32 @@ class WorkerRuntime:
         agents = {canonical_agent_name(agent) for agent in self.settings.agent_commands}
         agents.add(canonical_agent_name(self.settings.default_agent))
         return [f"agent:{agent}" for agent in sorted(agents)]
+
+    async def _register(self) -> None:
+        await self.api.register(
+            self.settings.worker_name,
+            self.settings.concurrency,
+            capabilities=self.capabilities(),
+            metadata={"default_agent": self.settings.default_agent},
+            worker_kind="command",
+            default_agent=self.settings.default_agent,
+        )
+
+    async def _recover_registration(self) -> bool:
+        LOGGER.warning(
+            "worker %s is no longer registered; re-registering",
+            self.settings.worker_id,
+        )
+        try:
+            async with self._registration_lock:
+                await self._register()
+        except Exception:
+            LOGGER.exception(
+                "worker %s re-registration failed", self.settings.worker_id
+            )
+            return False
+        LOGGER.info("worker %s re-registered", self.settings.worker_id)
+        return True
 
     async def _progress(
         self,
@@ -478,6 +523,8 @@ class WorkerRuntime:
                 cancel_task_ids = await self.api.heartbeat(running_claims)
                 for task_id in cancel_task_ids:
                     await self.cancel_task(task_id)
+            except WorkerNotRegisteredError:
+                await self._recover_registration()
             except Exception:
                 LOGGER.exception("heartbeat failed")
             try:
@@ -493,14 +540,7 @@ class WorkerRuntime:
         self.claim_tokens.pop(task_id, None)
 
     async def run(self, once: bool = False) -> None:
-        await self.api.register(
-            self.settings.worker_name,
-            self.settings.concurrency,
-            capabilities=self.capabilities(),
-            metadata={"default_agent": self.settings.default_agent},
-            worker_kind="command",
-            default_agent=self.settings.default_agent,
-        )
+        await self._register()
         LOGGER.info("worker %s registered", self.settings.worker_id)
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         try:
@@ -512,6 +552,10 @@ class WorkerRuntime:
                     except httpx.ReadTimeout:
                         LOGGER.warning("claim request timed out; retrying")
                         continue
+                    except WorkerNotRegisteredError:
+                        if await self._recover_registration():
+                            continue
+                        break
                     if task is None:
                         break
                     claimed_any = True
@@ -548,6 +592,7 @@ class UnifiedWorkerRuntime:
         self.claim_tokens: Dict[str, str] = {}
         self.cancelled: Set[str] = set()
         self.stopping = asyncio.Event()
+        self._registration_lock = asyncio.Lock()
         self.process_runtime = WorkerRuntime(settings, api)
         self.gateway_runtime = None
         if gateway is not None:
@@ -607,6 +652,39 @@ class UnifiedWorkerRuntime:
             capabilities.discard("agent:hermes")
         return sorted(capabilities)
 
+    async def _register(self) -> None:
+        routes = await self._gateway_routes()
+        await self.api.register(
+            self.settings.worker_name,
+            self.settings.concurrency,
+            capabilities=self.capabilities(),
+            metadata={
+                "worker_kind": "unified",
+                "default_agent": self.settings.default_agent,
+                "gateway_id": self.settings.gateway_id or None,
+                "profiles": [route["profile"] for route in routes],
+            },
+            worker_kind="unified",
+            default_agent=self.settings.default_agent,
+            routes=routes,
+        )
+
+    async def _recover_registration(self) -> bool:
+        LOGGER.warning(
+            "worker %s is no longer registered; re-registering",
+            self.settings.worker_id,
+        )
+        try:
+            async with self._registration_lock:
+                await self._register()
+        except Exception:
+            LOGGER.exception(
+                "worker %s re-registration failed", self.settings.worker_id
+            )
+            return False
+        LOGGER.info("worker %s re-registered", self.settings.worker_id)
+        return True
+
     async def run_task(self, task: Dict[str, Any]) -> None:
         agent = canonical_agent_name(
             task.get("resolved_execution_agent")
@@ -643,6 +721,8 @@ class UnifiedWorkerRuntime:
                 cancel_task_ids = await self.api.heartbeat(running_claims)
                 for task_id in cancel_task_ids:
                     await self.cancel_task(task_id)
+            except WorkerNotRegisteredError:
+                await self._recover_registration()
             except Exception:
                 LOGGER.exception("heartbeat failed")
             try:
@@ -687,21 +767,7 @@ class UnifiedWorkerRuntime:
         return routes
 
     async def run(self, once: bool = False) -> None:
-        routes = await self._gateway_routes()
-        await self.api.register(
-            self.settings.worker_name,
-            self.settings.concurrency,
-            capabilities=self.capabilities(),
-            metadata={
-                "worker_kind": "unified",
-                "default_agent": self.settings.default_agent,
-                "gateway_id": self.settings.gateway_id or None,
-                "profiles": [route["profile"] for route in routes],
-            },
-            worker_kind="unified",
-            default_agent=self.settings.default_agent,
-            routes=routes,
-        )
+        await self._register()
         LOGGER.info("unified worker %s registered", self.settings.worker_id)
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         try:
@@ -713,6 +779,10 @@ class UnifiedWorkerRuntime:
                     except httpx.ReadTimeout:
                         LOGGER.warning("claim request timed out; retrying")
                         continue
+                    except WorkerNotRegisteredError:
+                        if await self._recover_registration():
+                            continue
+                        break
                     if task is None:
                         break
                     claimed_any = True

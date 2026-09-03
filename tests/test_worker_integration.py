@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -17,6 +18,7 @@ from hermes.storage import SQLiteStore
 from hermes.worker import (
     UnifiedWorkerRuntime,
     WorkerAPI,
+    WorkerNotRegisteredError,
     WorkerRuntime,
     resolve_command_for_platform,
 )
@@ -90,6 +92,123 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("command", worker["worker_kind"])
         self.assertEqual("codex", worker["default_agent"])
         self.assertEqual("codex", worker["routes"][0]["default_agent"])
+
+    async def test_worker_api_maps_evicted_heartbeat_to_registration_loss(self) -> None:
+        await self.api.register("Mock Worker", 1)
+        self.store.run_maintenance(now=time.time() + 901)
+
+        with self.assertRaises(WorkerNotRegisteredError):
+            await self.api.heartbeat([])
+        with self.assertRaises(WorkerNotRegisteredError):
+            await self.api.claim()
+
+    async def test_command_worker_recovers_when_claim_detects_registration_loss(
+        self,
+    ) -> None:
+        api = AsyncMock()
+        api.register = AsyncMock()
+        api.claim = AsyncMock(side_effect=[WorkerNotRegisteredError("missing"), None])
+        runtime = WorkerRuntime(self.worker_settings, api)
+
+        await runtime.run(once=True)
+
+        self.assertEqual(2, api.register.await_count)
+        self.assertEqual(2, api.claim.await_count)
+
+    async def test_command_heartbeat_re_registers_only_on_registration_loss(
+        self,
+    ) -> None:
+        api = AsyncMock()
+        api.heartbeat = AsyncMock(side_effect=WorkerNotRegisteredError("missing"))
+        api.register = AsyncMock()
+        runtime = WorkerRuntime(self.worker_settings, api)
+
+        async def stop() -> None:
+            await asyncio.sleep(0.01)
+            runtime.stopping.set()
+
+        stopper = asyncio.create_task(stop())
+        await runtime.heartbeat_loop()
+        await stopper
+        self.assertEqual(1, api.register.await_count)
+
+    async def test_command_heartbeat_does_not_re_register_for_transport_errors(
+        self,
+    ) -> None:
+        api = AsyncMock()
+        api.heartbeat = AsyncMock(side_effect=httpx.ReadTimeout("temporary"))
+        api.register = AsyncMock()
+        runtime = WorkerRuntime(self.worker_settings, api)
+
+        async def stop() -> None:
+            await asyncio.sleep(0.01)
+            runtime.stopping.set()
+
+        stopper = asyncio.create_task(stop())
+        await runtime.heartbeat_loop()
+        await stopper
+        api.register.assert_not_awaited()
+
+    async def test_unified_reregister_rebuilds_gateway_routes(self) -> None:
+        gateway = AsyncMock()
+        gateway.discover_profiles = AsyncMock(side_effect=[["before"], ["after"]])
+        api = AsyncMock()
+        api.register = AsyncMock()
+        settings = UnifiedWorkerSettings(
+            coordinator_url="http://test",
+            worker_id="unified-reconnect-worker",
+            worker_name="Unified Reconnect Worker",
+            shared_secret="worker-test-secret",
+            default_agent="hermes",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "hermes": [sys.executable, "-c", "print('unused')", "{prompt}"],
+            },
+            allowed_workdir=self.temporary_directory.name,
+            gateway_id="gateway",
+            profiles=[],
+        )
+        runtime = UnifiedWorkerRuntime(settings, api, gateway)
+
+        await runtime._register()
+        await runtime._register()
+
+        self.assertEqual(2, gateway.discover_profiles.await_count)
+        first_routes = api.register.await_args_list[0].kwargs["routes"]
+        second_routes = api.register.await_args_list[1].kwargs["routes"]
+        self.assertEqual("before", first_routes[0]["profile"])
+        self.assertEqual("after", second_routes[0]["profile"])
+
+    async def test_unified_worker_recovers_when_claim_detects_registration_loss(
+        self,
+    ) -> None:
+        gateway = AsyncMock()
+        gateway.discover_profiles = AsyncMock(side_effect=[["before"], ["after"]])
+        api = AsyncMock()
+        api.register = AsyncMock()
+        api.claim = AsyncMock(side_effect=[WorkerNotRegisteredError("missing"), None])
+        settings = UnifiedWorkerSettings(
+            coordinator_url="http://test",
+            worker_id="unified-claim-reconnect-worker",
+            worker_name="Unified Claim Reconnect Worker",
+            shared_secret="worker-test-secret",
+            default_agent="hermes",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "hermes": [sys.executable, "-c", "print('unused')", "{prompt}"],
+            },
+            allowed_workdir=self.temporary_directory.name,
+            gateway_id="gateway",
+            profiles=[],
+            poll_interval_seconds=0,
+        )
+        runtime = UnifiedWorkerRuntime(settings, api, gateway)
+
+        await runtime.run(once=True)
+
+        self.assertEqual(2, api.register.await_count)
+        self.assertEqual(2, api.claim.await_count)
+        self.assertEqual(2, gateway.discover_profiles.await_count)
 
     async def test_command_worker_retries_after_claim_read_timeout(self) -> None:
         runtime = WorkerRuntime(self.worker_settings, self.api)

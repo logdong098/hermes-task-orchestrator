@@ -41,6 +41,7 @@ def create_app(
 ) -> FastAPI:
     configured = settings or CoordinatorSettings.from_env()
     repository = store or SQLiteStore(configured.database_path)
+    repository.worker_eviction_seconds = configured.worker_eviction_seconds
     repository.reconciliation_grace_seconds = configured.reconciliation_grace_seconds
     repository.reconciliation_backoff_seconds = (
         configured.reconciliation_backoff_seconds
@@ -67,7 +68,7 @@ def create_app(
                 try:
                     repository.run_maintenance()
                 except Exception:
-                    LOGGER.exception("task maintenance failed")
+                    LOGGER.exception("coordinator maintenance failed")
                 try:
                     await asyncio.wait_for(
                         stopping.wait(),

@@ -115,6 +115,7 @@ class CoordinatorSettings:
     worker_shared_secret: str = ""
     worker_secrets: Dict[str, str] = field(default_factory=dict)
     worker_stale_seconds: int = 45
+    worker_eviction_seconds: int = 900
     task_lease_seconds: int = 30
     hmac_max_clock_skew_seconds: int = 300
     default_task_timeout_seconds: int = 900
@@ -133,6 +134,14 @@ class CoordinatorSettings:
     planner_max_attempts: int = 2
     planner_max_output_bytes: int = 2_000_000
 
+    def __post_init__(self) -> None:
+        if self.worker_stale_seconds <= 0:
+            raise ValueError("worker_stale_seconds must be positive")
+        if self.worker_eviction_seconds <= self.worker_stale_seconds:
+            raise ValueError(
+                "worker_eviction_seconds must be greater than worker_stale_seconds"
+            )
+
     @classmethod
     def from_env(cls) -> "CoordinatorSettings":
         load_env_file()
@@ -145,6 +154,7 @@ class CoordinatorSettings:
             worker_shared_secret=os.getenv("HERMES_WORKER_SHARED_SECRET", ""),
             worker_secrets=_json_dict("HERMES_WORKER_SECRETS_JSON"),
             worker_stale_seconds=_int("HERMES_WORKER_STALE_SECONDS", 45),
+            worker_eviction_seconds=_int("HERMES_WORKER_EVICTION_SECONDS", 900),
             task_lease_seconds=_int("HERMES_TASK_LEASE_SECONDS", 30),
             hmac_max_clock_skew_seconds=_int("HERMES_HMAC_MAX_CLOCK_SKEW_SECONDS", 300),
             default_task_timeout_seconds=_int(

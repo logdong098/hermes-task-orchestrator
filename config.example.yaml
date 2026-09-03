@@ -6,6 +6,7 @@ coordinator:
   worker_shared_secret: ${HERMES_WORKER_SHARED_SECRET}
   worker_secrets: {}
   worker_stale_seconds: 45
+  worker_eviction_seconds: 900
   task_lease_seconds: 30
   hmac_max_clock_skew_seconds: 300
   default_task_timeout_seconds: 900

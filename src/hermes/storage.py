@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -13,6 +14,8 @@ from .models import (
     agent_names_match,
     canonical_agent_name,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ConflictError(RuntimeError):
@@ -51,6 +54,7 @@ class SQLiteStore:
         database_path: str,
         reconciliation_grace_seconds: int = 3600,
         reconciliation_backoff_seconds: int = 5,
+        worker_eviction_seconds: int = 900,
     ) -> None:
         if database_path == ":memory:":
             raise ValueError(
@@ -59,6 +63,7 @@ class SQLiteStore:
         self.database_path = database_path
         self.reconciliation_grace_seconds = reconciliation_grace_seconds
         self.reconciliation_backoff_seconds = reconciliation_backoff_seconds
+        self.worker_eviction_seconds = worker_eviction_seconds
 
     def initialize(self) -> None:
         if self.database_path != ":memory:":
@@ -73,7 +78,8 @@ class SQLiteStore:
                     capabilities_json TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
                     registered_at REAL NOT NULL,
-                    last_heartbeat_at REAL NOT NULL
+                    last_heartbeat_at REAL NOT NULL,
+                    evicted_at REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS worker_routes (
@@ -188,6 +194,7 @@ class SQLiteStore:
             for column, definition in {
                 "worker_kind": "TEXT NOT NULL DEFAULT 'command'",
                 "default_agent": "TEXT NOT NULL DEFAULT 'default'",
+                "evicted_at": "REAL",
             }.items():
                 if column not in worker_columns:
                     connection.execute(
@@ -269,6 +276,7 @@ class SQLiteStore:
                 """
                 SELECT * FROM workers w
                 WHERE worker_kind = 'command'
+                  AND evicted_at IS NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM worker_routes r WHERE r.worker_id = w.worker_id
                   )
@@ -451,8 +459,8 @@ class SQLiteStore:
                 INSERT INTO workers (
                     worker_id, name, max_concurrency, capabilities_json,
                     metadata_json, registered_at, last_heartbeat_at, worker_kind,
-                    default_agent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    default_agent, evicted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     name = excluded.name,
                     max_concurrency = excluded.max_concurrency,
@@ -460,7 +468,8 @@ class SQLiteStore:
                     metadata_json = excluded.metadata_json,
                     last_heartbeat_at = excluded.last_heartbeat_at,
                     worker_kind = excluded.worker_kind,
-                    default_agent = excluded.default_agent
+                    default_agent = excluded.default_agent,
+                    evicted_at = NULL
                 """,
                 (
                     worker["worker_id"],
@@ -594,7 +603,10 @@ class SQLiteStore:
             connection.execute("BEGIN IMMEDIATE")
             self._maintenance(connection, current)
             cursor = connection.execute(
-                "UPDATE workers SET last_heartbeat_at = ? WHERE worker_id = ?",
+                """
+                UPDATE workers SET last_heartbeat_at = ?
+                WHERE worker_id = ? AND evicted_at IS NULL
+                """,
                 (current, worker_id),
             )
             if cursor.rowcount == 0:
@@ -697,7 +709,7 @@ class SQLiteStore:
         current = now if now is not None else time.time()
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM workers ORDER BY worker_id"
+                "SELECT * FROM workers WHERE evicted_at IS NULL ORDER BY worker_id"
             ).fetchall()
             route_rows = connection.execute(
                 "SELECT * FROM worker_routes ORDER BY worker_id, route_id"
@@ -720,7 +732,8 @@ class SQLiteStore:
         current = now if now is not None else time.time()
         with self._connect() as connection:
             rows = connection.execute("""SELECT r.*, w.worker_kind FROM worker_routes r
-                JOIN workers w ON w.worker_id = r.worker_id ORDER BY r.route_id""").fetchall()
+                JOIN workers w ON w.worker_id = r.worker_id
+                WHERE w.evicted_at IS NULL ORDER BY r.route_id""").fetchall()
         result = []
         for row in rows:
             item = self._route(row)
@@ -874,7 +887,11 @@ class SQLiteStore:
             connection.execute("BEGIN IMMEDIATE")
             self._maintenance(connection, current)
             worker = connection.execute(
-                "SELECT max_concurrency, capabilities_json, worker_kind, default_agent FROM workers WHERE worker_id = ?",
+                """
+                SELECT max_concurrency, capabilities_json, worker_kind, default_agent
+                FROM workers
+                WHERE worker_id = ? AND evicted_at IS NULL
+                """,
                 (worker_id,),
             ).fetchone()
             if worker is None:
@@ -2179,6 +2196,39 @@ class SQLiteStore:
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)
             ).fetchone()
             self._enqueue_notification(connection, updated, now)
+
+        cutoff = now - self.worker_eviction_seconds
+        candidates = connection.execute(
+            """
+            SELECT worker_id, last_heartbeat_at
+            FROM workers
+            WHERE evicted_at IS NULL AND last_heartbeat_at < ?
+            ORDER BY worker_id
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in candidates:
+            cursor = connection.execute(
+                """
+                UPDATE workers SET evicted_at = ?
+                WHERE worker_id = ?
+                  AND evicted_at IS NULL
+                  AND last_heartbeat_at < ?
+                """,
+                (now, row["worker_id"], cutoff),
+            )
+            if cursor.rowcount != 1:
+                continue
+            connection.execute(
+                "DELETE FROM worker_routes WHERE worker_id = ?",
+                (row["worker_id"],),
+            )
+            LOGGER.info(
+                "worker evicted: worker_id=%s last_heartbeat_at=%s offline_seconds=%s",
+                row["worker_id"],
+                row["last_heartbeat_at"],
+                now - row["last_heartbeat_at"],
+            )
 
     def _enqueue_notification(
         self, connection: sqlite3.Connection, task: sqlite3.Row, now: float

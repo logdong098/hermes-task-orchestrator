@@ -12,7 +12,7 @@ import httpx
 
 from .config import GatewayWorkerSettings
 from .gateway_adapter import GatewayAdapter
-from .worker import WorkerAPI
+from .worker import WorkerAPI, WorkerNotRegisteredError
 
 LOGGER = logging.getLogger("hermes.gateway_worker")
 TERMINAL = {
@@ -36,6 +36,7 @@ class GatewayWorker:
         self.claim_tokens: Dict[str, str] = {}
         self.cancelled: set[str] = set()
         self.stopping = asyncio.Event()
+        self._registration_lock = asyncio.Lock()
         if not settings.worker_id or not settings.shared_secret:
             raise ValueError("gateway worker id and shared secret are required")
         if not settings.gateway_id:
@@ -529,6 +530,8 @@ class GatewayWorker:
                 ]
                 ids = await self.api.heartbeat(running_claims)
                 self.cancelled.update(ids)
+            except WorkerNotRegisteredError:
+                await self._recover_registration()
             except Exception:
                 LOGGER.exception("heartbeat failed")
             try:
@@ -538,7 +541,7 @@ class GatewayWorker:
             except asyncio.TimeoutError:
                 pass
 
-    async def run(self, once: bool = False) -> None:
+    async def _register(self) -> None:
         discovered = self.settings.profiles or await self.gateway.discover_profiles()
         profiles = list(
             dict.fromkeys(profile.strip() for profile in discovered if profile.strip())
@@ -574,6 +577,25 @@ class GatewayWorker:
             default_agent=self.settings.default_agent,
             routes=routes,
         )
+
+    async def _recover_registration(self) -> bool:
+        LOGGER.warning(
+            "worker %s is no longer registered; re-registering",
+            self.settings.worker_id,
+        )
+        try:
+            async with self._registration_lock:
+                await self._register()
+        except Exception:
+            LOGGER.exception(
+                "worker %s re-registration failed", self.settings.worker_id
+            )
+            return False
+        LOGGER.info("worker %s re-registered", self.settings.worker_id)
+        return True
+
+    async def run(self, once: bool = False) -> None:
+        await self._register()
         hb = asyncio.create_task(self.heartbeat_loop())
         try:
             while not self.stopping.is_set():
@@ -584,6 +606,10 @@ class GatewayWorker:
                     except httpx.ReadTimeout:
                         LOGGER.warning("claim request timed out; retrying")
                         continue
+                    except WorkerNotRegisteredError:
+                        if await self._recover_registration():
+                            continue
+                        break
                     if not task:
                         break
                     claimed = True
