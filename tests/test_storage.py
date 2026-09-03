@@ -364,7 +364,9 @@ class SQLiteStoreTests(unittest.TestCase):
 
     def test_explicit_planning_modes_control_initial_state(self) -> None:
         direct = self.create_task(planning_mode="direct", planner_agent=None)
-        planned = self.create_task(planning_mode="plan", planner_agent="codex")
+        planned = self.create_task(
+            planning_mode="plan", planner_agent="codex-with-chatgpt"
+        )
         self.assertEqual("pending", direct["status"])
         self.assertEqual("direct", direct["planning_mode"])
         self.assertEqual("planning_pending", planned["status"])
@@ -544,7 +546,9 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertEqual("cancelled", final["status"])
 
     def test_planning_stage_persists_artifacts_before_worker_claim(self) -> None:
-        task = self.create_task(planner_agent="codex", execution_agent="codex")
+        task = self.create_task(
+            planner_agent="codex-with-chatgpt", execution_agent="codex"
+        )
         self.assertEqual("planning_pending", task["status"])
         self.assertIsNone(self.store.claim_task("worker-a", 30, now=101))
 
@@ -552,7 +556,11 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertEqual(task["id"], planning["id"])
         self.assertEqual("planning", planning["status"])
         planned = self.store.complete_planning(
-            task["id"], "1. add tests", "original plus plan", now=102
+            task["id"],
+            "1. add tests",
+            "original plus plan",
+            planner_claim_token=planning["planner_claim_token"],
+            now=102,
         )
         self.assertEqual("pending", planned["status"])
         self.assertEqual("1. add tests", planned["plan"])
@@ -590,7 +598,7 @@ class SQLiteStoreTests(unittest.TestCase):
 
     def test_expired_planner_lease_retries_then_times_out(self) -> None:
         task = self.store.create_task(
-            {"prompt": "plan me", "planner_agent": "codex"},
+            {"prompt": "plan me", "planner_agent": "codex-with-chatgpt"},
             60,
             600,
             1,
@@ -606,7 +614,7 @@ class SQLiteStoreTests(unittest.TestCase):
 
     def test_stale_planner_attempt_cannot_complete_new_attempt(self) -> None:
         task = self.store.create_task(
-            {"prompt": "plan me", "planner_agent": "codex"},
+            {"prompt": "plan me", "planner_agent": "codex-with-chatgpt"},
             60,
             600,
             1,
@@ -624,11 +632,30 @@ class SQLiteStoreTests(unittest.TestCase):
                 "stale plan",
                 "stale execution prompt",
                 now=114,
+                planner_claim_token=first["planner_claim_token"],
                 expected_attempt_count=first["planner_attempt_count"],
             )
         current = self.store.get_task(task["id"])
         self.assertEqual("planning", current["status"])
         self.assertIsNone(current["plan"])
+
+    def test_cancelled_planning_task_invalidates_planner_claim(self) -> None:
+        task = self.store.create_task(
+            {"prompt": "cancel plan", "planner_agent": "codex-with-chatgpt"},
+            60,
+            600,
+            1,
+            default_planner_max_attempts=1,
+            now=100,
+        )
+        planning = self.store.claim_planning_task(30, now=101)
+        self.assertIsNotNone(planning)
+
+        cancelled = self.store.cancel_task(task["id"], now=102)
+
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertIsNone(cancelled["planner_claim_token"])
+        self.assertIsNone(cancelled["planner_lease_expires_at"])
 
     def test_legacy_database_migration_preserves_pending_task(self) -> None:
         database = str(Path(self.temporary_directory.name) / "legacy.db")

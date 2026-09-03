@@ -83,6 +83,63 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("succeeded", result["status"])
         self.assertEqual("mock-hermes: integration hello\n", result["result"])
 
+    async def test_cc_executes_in_requested_workdir_with_planned_prompt(self) -> None:
+        project_directory = (
+            Path(self.temporary_directory.name) / "project-a"
+        ).resolve()
+        project_directory.mkdir()
+        settings = WorkerSettings(
+            coordinator_url="http://test",
+            worker_id="mock-worker",
+            worker_name="Mock Worker",
+            shared_secret="worker-test-secret",
+            default_agent="cc",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "cc": [
+                    sys.executable,
+                    "-c",
+                    "import os, sys; print(os.getcwd() + ' :: ' + sys.argv[1])",
+                    "{prompt}",
+                ]
+            },
+            allowed_workdir=self.temporary_directory.name,
+            task_timeout_seconds=10,
+        )
+        await self.api.register(
+            "Mock Worker", 1, capabilities=["agent:claude-code"], default_agent="cc"
+        )
+        created = self.store.create_task(
+            {
+                "prompt": "original request",
+                "planner_agent": "codex-with-chatgpt",
+                "planning_mode": "plan",
+                "execution_agent": "cc",
+                "workdir": "project-a",
+                "timeout_seconds": 10,
+            },
+            default_timeout_seconds=10,
+            max_timeout_seconds=10,
+            default_max_attempts=1,
+        )
+        planning = self.store.claim_planning_task(30)
+        self.assertIsNotNone(planning)
+        self.store.complete_planning(
+            created["id"],
+            "plan details",
+            "planned implementation",
+            planner_claim_token=planning["planner_claim_token"],
+        )
+        task = await self.api.claim()
+
+        await WorkerRuntime(settings, self.api).run_task(task)
+
+        result = self.store.get_task(created["id"])
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual(
+            f"{project_directory} :: planned implementation\n", result["result"]
+        )
+
     async def test_runtime_registers_structured_command_worker(self) -> None:
         runtime = WorkerRuntime(self.worker_settings, self.api)
 

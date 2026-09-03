@@ -28,6 +28,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(60, settings.worker_stale_seconds)
         self.assertEqual(1200, settings.worker_eviction_seconds)
 
+    def test_coordinator_forces_codex_with_chatgpt_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
+                    "HERMES_PLANNER_DEFAULT_AGENT": "claude",
+                },
+                clear=True,
+            ):
+                settings = CoordinatorSettings.from_env()
+
+        self.assertEqual("codex-with-chatgpt", settings.default_planner_agent)
+
+    def test_coordinator_rejects_non_c2c_planner(self) -> None:
+        with self.assertRaisesRegex(ValueError, "codex-with-chatgpt"):
+            CoordinatorSettings(default_planner_agent="codex")
+
     def test_coordinator_rejects_invalid_worker_lifecycle_thresholds(self) -> None:
         with self.assertRaisesRegex(ValueError, "worker_stale_seconds"):
             CoordinatorSettings(worker_stale_seconds=0)

@@ -17,18 +17,27 @@ from .models import (
     PlanningMode,
     TaskCreate,
     TaskEventResponse,
+    TaskPlanningFailure,
+    TaskPlanningLease,
+    TaskPlanSubmit,
     TaskProgressUpdate,
     TaskReconcileRequest,
     TaskRemoteRunUpdate,
     TaskResponse,
     TaskResult,
+    TaskStatus,
     TaskStatusUpdate,
     WorkerRegistration,
     WorkerResponse,
     WorkerRouteResponse,
     agent_names_match,
 )
-from .planner import PlannerRuntime, PlannerSettings
+from .planner import (
+    C2C_PLANNER_AGENT,
+    C2C_PROTOCOL_VERSION,
+    build_c2c_init_message,
+    build_execution_prompt,
+)
 from .security import verify_signature
 from .storage import ConflictError, NotFoundError, SQLiteStore
 
@@ -45,17 +54,6 @@ def create_app(
     repository.reconciliation_grace_seconds = configured.reconciliation_grace_seconds
     repository.reconciliation_backoff_seconds = (
         configured.reconciliation_backoff_seconds
-    )
-    planner = PlannerRuntime(
-        PlannerSettings(
-            agent_commands=configured.planner_commands,
-            default_agent=configured.default_planner_agent,
-            timeout_seconds=configured.planner_timeout_seconds,
-            max_output_bytes=configured.planner_max_output_bytes,
-            poll_interval_seconds=configured.planner_poll_interval_seconds,
-            lease_seconds=configured.planner_lease_seconds,
-        ),
-        repository,
     )
 
     @asynccontextmanager
@@ -78,15 +76,10 @@ def create_app(
                     pass
 
         maintenance_task = asyncio.create_task(maintenance_loop())
-        planner_task = asyncio.create_task(planner.run(stopping))
         try:
             yield
         finally:
             stopping.set()
-            for task_id in list(planner.processes):
-                await planner.cancel_task(task_id)
-            planner_task.cancel()
-            await asyncio.gather(planner_task, return_exceptions=True)
             await maintenance_task
 
     app = FastAPI(
@@ -96,7 +89,6 @@ def create_app(
     )
     app.state.settings = configured
     app.state.store = repository
-    app.state.planner = planner
 
     async def worker_auth(
         request: Request,
@@ -306,9 +298,7 @@ def create_app(
         )
         payload["planning_mode"] = resolved_mode.value
         payload["planner_agent"] = (
-            payload.get("planner_agent") or configured.default_planner_agent
-            if resolved_mode == PlanningMode.PLAN
-            else None
+            C2C_PLANNER_AGENT if resolved_mode == PlanningMode.PLAN else None
         )
         return repository.create_task(
             payload,
@@ -317,6 +307,97 @@ def create_app(
             configured.default_max_attempts,
             configured.planner_max_attempts,
         )
+
+    @app.post(
+        "/api/v1/planner/tasks/claim",
+        dependencies=[Depends(director_auth)],
+    )
+    def claim_planner_task() -> Dict[str, Any]:
+        """Lease a task for the active Codex with ChatGPT controller."""
+
+        task = repository.claim_planning_task(configured.planner_lease_seconds)
+        if task is None:
+            return {"task": None}
+        return {
+            "task": task,
+            "protocol": {
+                "name": C2C_PLANNER_AGENT,
+                "version": C2C_PROTOCOL_VERSION,
+                "init": build_c2c_init_message(task),
+            },
+        }
+
+    @app.post(
+        "/api/v1/tasks/{task_id}/planning-lease",
+        response_model=TaskResponse,
+        dependencies=[Depends(director_auth)],
+    )
+    def renew_planning_lease(
+        task_id: str,
+        update: TaskPlanningLease,
+    ) -> Dict[str, Any]:
+        try:
+            renewed = repository.extend_planning_lease(
+                task_id,
+                configured.planner_lease_seconds,
+                planner_claim_token=update.planner_claim_token,
+            )
+            if not renewed:
+                raise ConflictError("planner lease is no longer active")
+            return task_or_404(task_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/tasks/{task_id}/plan",
+        response_model=TaskResponse,
+        dependencies=[Depends(director_auth)],
+    )
+    def submit_plan(task_id: str, plan: TaskPlanSubmit) -> Dict[str, Any]:
+        try:
+            current = repository.get_task(task_id)
+            execution_prompt = plan.execution_prompt or build_execution_prompt(
+                current["prompt"], plan.plan
+            )
+            repository.complete_planning(
+                task_id,
+                plan.plan,
+                execution_prompt,
+                planner_claim_token=plan.planner_claim_token,
+                expected_attempt_count=current["planner_attempt_count"],
+            )
+            return task_or_404(task_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/tasks/{task_id}/planning-failure",
+        response_model=TaskResponse,
+        dependencies=[Depends(director_auth)],
+    )
+    def report_planning_failure(
+        task_id: str,
+        failure: TaskPlanningFailure,
+    ) -> Dict[str, Any]:
+        try:
+            current = repository.get_task(task_id)
+            repository.fail_planning(
+                task_id,
+                TaskStatus.FAILED.value,
+                failure.error,
+                retryable=failure.retryable,
+                planner_claim_token=failure.planner_claim_token,
+                expected_attempt_count=current["planner_attempt_count"],
+            )
+            return task_or_404(task_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get(
         "/api/v1/tasks",
@@ -356,7 +437,6 @@ def create_app(
     async def cancel_task(task_id: str) -> Dict[str, Any]:
         try:
             task = repository.cancel_task(task_id)
-            await planner.cancel_task(task_id)
             return task
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

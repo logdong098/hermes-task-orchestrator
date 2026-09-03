@@ -8,10 +8,8 @@ services:
       HERMES_DATABASE_PATH: /data/hermes.db
       HERMES_DIRECTOR_API_KEY: ${HERMES_DIRECTOR_API_KEY:?set HERMES_DIRECTOR_API_KEY}
       HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
-      HERMES_PLANNER_DEFAULT_AGENT: ${HERMES_PLANNER_DEFAULT_AGENT:-codex}
-      # 基础镜像不内置 Codex/Claude；默认 mock 仅用于本地 Compose 验证。
-      # 生产环境必须覆盖此值并使用包含真实 Planner CLI 的受控镜像。
-      HERMES_PLANNER_COMMANDS_JSON: '${HERMES_PLANNER_COMMANDS_JSON:-{"codex":["python","-m","hermes.mock_hermes","-q","{prompt}"]}}'
+      # 规划由外部 Codex 主控通过 codex-with-chatgpt Skill 完成；
+      # Coordinator 不启动本地 Planner CLI。
     volumes:
       - hermes-data:/data
     healthcheck:
@@ -33,9 +31,9 @@ services:
       HERMES_WORKER_SHARED_SECRET: ${HERMES_WORKER_SHARED_SECRET:?set HERMES_WORKER_SHARED_SECRET}
       HERMES_WORKER_ID: ${HERMES_WORKER_ID:-docker-worker}
       HERMES_WORKER_NAME: ${HERMES_WORKER_NAME:-Docker Mock Worker}
-      HERMES_WORKER_DEFAULT_AGENT: ${HERMES_WORKER_DEFAULT_AGENT:-codex}
+      HERMES_WORKER_DEFAULT_AGENT: ${HERMES_WORKER_DEFAULT_AGENT:-cc}
       HERMES_WORKER_COMMAND: ${HERMES_WORKER_COMMAND:-python -m hermes.mock_hermes -q {prompt}}
-      HERMES_WORKER_AGENTS_JSON: '${HERMES_WORKER_AGENTS_JSON:-{"codex":["python","-m","hermes.mock_hermes","-q","{prompt}"]}}'
+      HERMES_WORKER_AGENTS_JSON: '${HERMES_WORKER_AGENTS_JSON:-{"cc":["python","-m","hermes.mock_hermes","-q","{prompt}"]}}'
       HERMES_WORKER_ALLOWED_WORKDIR: /workspace
       HERMES_WORKER_CONCURRENCY: ${HERMES_WORKER_CONCURRENCY:-1}
     volumes:

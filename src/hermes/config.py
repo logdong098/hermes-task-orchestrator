@@ -78,13 +78,6 @@ def _json_agent_commands(name: str) -> Dict[str, List[str]]:
     return commands
 
 
-def _default_planner_commands() -> Dict[str, List[str]]:
-    return {
-        "claude": ["claude", "--permission-mode", "plan", "-p", "{prompt}"],
-        "codex": ["codex", "exec", "--sandbox", "read-only", "{prompt}"],
-    }
-
-
 def _default_execution_commands() -> Dict[str, List[str]]:
     """Commands used by the unified worker when no override is supplied."""
     return {
@@ -124,15 +117,9 @@ class CoordinatorSettings:
     maintenance_interval_seconds: float = 5.0
     reconciliation_grace_seconds: int = 3600
     reconciliation_backoff_seconds: int = 5
-    default_planner_agent: str = "codex"
-    planner_commands: Dict[str, List[str]] = field(
-        default_factory=_default_planner_commands
-    )
-    planner_timeout_seconds: int = 900
-    planner_poll_interval_seconds: float = 2.0
+    default_planner_agent: str = "codex-with-chatgpt"
     planner_lease_seconds: int = 30
     planner_max_attempts: int = 2
-    planner_max_output_bytes: int = 2_000_000
 
     def __post_init__(self) -> None:
         if self.worker_stale_seconds <= 0:
@@ -141,13 +128,12 @@ class CoordinatorSettings:
             raise ValueError(
                 "worker_eviction_seconds must be greater than worker_stale_seconds"
             )
+        if self.default_planner_agent != "codex-with-chatgpt":
+            raise ValueError("Hermes planning must use the codex-with-chatgpt Skill")
 
     @classmethod
     def from_env(cls) -> "CoordinatorSettings":
         load_env_file()
-        planner_commands = _json_agent_commands("HERMES_PLANNER_COMMANDS_JSON")
-        if not planner_commands:
-            planner_commands = _default_planner_commands()
         return cls(
             database_path=os.getenv("HERMES_DATABASE_PATH", "data/hermes.db"),
             director_api_key=os.getenv("HERMES_DIRECTOR_API_KEY", ""),
@@ -171,15 +157,11 @@ class CoordinatorSettings:
             reconciliation_backoff_seconds=_int(
                 "HERMES_RECONCILIATION_BACKOFF_SECONDS", 5
             ),
-            default_planner_agent=os.getenv("HERMES_PLANNER_DEFAULT_AGENT", "codex"),
-            planner_commands=planner_commands,
-            planner_timeout_seconds=_int("HERMES_PLANNER_TIMEOUT_SECONDS", 900),
-            planner_poll_interval_seconds=_float(
-                "HERMES_PLANNER_POLL_INTERVAL_SECONDS", 2.0
-            ),
+            # Deliberately ignore the old HERMES_PLANNER_DEFAULT_AGENT
+            # override: planning must always use the Codex with ChatGPT Skill.
+            default_planner_agent="codex-with-chatgpt",
             planner_lease_seconds=_int("HERMES_PLANNER_LEASE_SECONDS", 30),
             planner_max_attempts=_int("HERMES_PLANNER_MAX_ATTEMPTS", 2),
-            planner_max_output_bytes=_int("HERMES_PLANNER_MAX_OUTPUT_BYTES", 2_000_000),
         )
 
     def worker_secret_for(self, worker_id: str) -> str:

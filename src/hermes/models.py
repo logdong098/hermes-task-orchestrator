@@ -146,8 +146,13 @@ class HeartbeatRequest(BaseModel):
 
 
 class PlannerAgent(str, Enum):
-    CLAUDE = "claude"
-    CODEX = "codex"
+    """The only supported planning backend.
+
+    ``codex-with-chatgpt`` is a Codex session workflow, not a local CLI
+    provider. The Coordinator therefore never accepts a local planner command.
+    """
+
+    CODEX_WITH_CHATGPT = "codex-with-chatgpt"
 
 
 class PlanningMode(str, Enum):
@@ -215,6 +220,31 @@ class TaskCreate(BaseModel):
 class TaskStatusUpdate(BaseModel):
     status: TaskStatus
     claim_token: str = Field(min_length=32, max_length=128)
+
+
+class TaskPlanSubmit(BaseModel):
+    """Plan returned by the external Codex with ChatGPT controller."""
+
+    planner_claim_token: str = Field(min_length=32, max_length=128)
+    plan: str = Field(min_length=1, max_length=2_000_000)
+    execution_prompt: Optional[str] = Field(default=None, max_length=2_000_000)
+
+    @field_validator("plan")
+    @classmethod
+    def plan_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("plan must not be blank")
+        return value
+
+
+class TaskPlanningFailure(BaseModel):
+    planner_claim_token: str = Field(min_length=32, max_length=128)
+    error: str = Field(min_length=1, max_length=100_000)
+    retryable: bool = True
+
+
+class TaskPlanningLease(BaseModel):
+    planner_claim_token: str = Field(min_length=32, max_length=128)
 
 
 class TaskProgressUpdate(BaseModel):
@@ -295,6 +325,7 @@ class TaskResponse(BaseModel):
     telegram_chat_id: Optional[str]
     idempotency_key: Optional[str] = None
     planner_agent: Optional[PlannerAgent] = None
+    planner_task_id: Optional[str] = None
     planning_mode: PlanningMode = PlanningMode.AUTO
     execution_agent: Optional[str] = None
     target_gateway_id: Optional[str] = None

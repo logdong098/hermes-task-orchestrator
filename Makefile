@@ -19,7 +19,7 @@ gateway-worker:
 	$(PYTHON_ENV) $(PYTHON) -m hermes.gateway_worker
 
 mock-worker:
-	HERMES_WORKER_DEFAULT_AGENT=codex HERMES_WORKER_AGENTS_JSON='{"codex":["$(PYTHON)","-m","hermes.mock_hermes","-q","{prompt}"]}' $(PYTHON_ENV) $(PYTHON) -m hermes.worker
+	HERMES_WORKER_DEFAULT_AGENT=cc HERMES_WORKER_AGENTS_JSON='{"cc":["$(PYTHON)","-m","hermes.mock_hermes","-q","{prompt}"]}' $(PYTHON_ENV) $(PYTHON) -m hermes.worker
 
 telegram:
 	$(PYTHON_ENV) $(PYTHON) -m hermes.telegram_bot

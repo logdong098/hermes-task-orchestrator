@@ -47,14 +47,14 @@ def main() -> None:
                 "HERMES_COORDINATOR_URL": base_url,
                 "HERMES_WORKER_ID": "e2e-worker",
                 "HERMES_WORKER_NAME": "E2E Mock Worker",
-                "HERMES_WORKER_DEFAULT_AGENT": "codex",
+                "HERMES_WORKER_DEFAULT_AGENT": "cc",
                 "HERMES_WORKER_ALLOWED_WORKDIR": temporary_directory,
                 "HERMES_WORKER_COMMAND": (
                     f"{sys.executable} -m hermes.mock_hermes -q {{prompt}}"
                 ),
                 "HERMES_WORKER_AGENTS_JSON": json.dumps(
                     {
-                        "codex": [
+                        "cc": [
                             sys.executable,
                             "-m",
                             "hermes.mock_hermes",
@@ -64,18 +64,6 @@ def main() -> None:
                     }
                 ),
                 "HERMES_WORKER_POLL_INTERVAL_SECONDS": "1",
-                "HERMES_PLANNER_POLL_INTERVAL_SECONDS": "0.1",
-                "HERMES_PLANNER_DEFAULT_AGENT": "codex",
-                "HERMES_PLANNER_COMMANDS_JSON": json.dumps(
-                    {
-                        "codex": [
-                            sys.executable,
-                            "-c",
-                            "import sys; print('plan: ' + sys.argv[1])",
-                            "{prompt}",
-                        ]
-                    }
-                ),
             }
         )
         coordinator = subprocess.Popen(
@@ -98,23 +86,36 @@ def main() -> None:
             headers = {"Authorization": "Bearer e2e-director-key"}
             created = httpx.post(
                 f"{base_url}/api/v1/tasks",
-                json={"prompt": "end-to-end hello", "timeout_seconds": 10},
+                json={
+                    "prompt": "end-to-end hello",
+                    "timeout_seconds": 10,
+                    "execution_agent": "cc",
+                },
                 headers=headers,
                 timeout=5,
             )
             created.raise_for_status()
             task_id = created.json()["id"]
-            for _ in range(50):
-                planned = httpx.get(
-                    f"{base_url}/api/v1/tasks/{task_id}",
-                    headers=headers,
-                    timeout=5,
-                )
-                planned.raise_for_status()
-                if planned.json()["status"] == "pending":
-                    break
-                time.sleep(0.1)
-            else:
+            planning = httpx.post(
+                f"{base_url}/api/v1/planner/tasks/claim",
+                headers=headers,
+                timeout=5,
+            )
+            planning.raise_for_status()
+            planning_task = planning.json()["task"]
+            if planning_task["id"] != task_id:
+                raise RuntimeError(f"unexpected planning task: {planning_task}")
+            planned = httpx.post(
+                f"{base_url}/api/v1/tasks/{task_id}/plan",
+                json={
+                    "planner_claim_token": planning_task["planner_claim_token"],
+                    "plan": "Run the worker in the assigned directory and verify the result.",
+                },
+                headers=headers,
+                timeout=5,
+            )
+            planned.raise_for_status()
+            if planned.json()["status"] != "pending":
                 raise RuntimeError(f"task was not planned: {planned.json()}")
             worker = subprocess.run(
                 [sys.executable, "-m", "hermes.worker", "--once"],

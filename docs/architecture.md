@@ -8,7 +8,7 @@
 
 1. 用户只与一个 Director Bot 交互，能够创建、查询、取消任务并查看 Worker。
 2. Coordinator 可靠保存任务，基于 Worker 注册、心跳和并发容量完成调度。
-3. 复杂任务由 Coordinator 在本机调用 Claude Code 或 Codex 生成并持久化执行计划；简单任务可跳过 Planner。
+3. 复杂任务由主控 Codex 强制使用 `codex-with-chatgpt` Skill 分析，Coordinator 通过受保护协议接收并持久化可执行开发文档；简单任务可跳过规划。
 4. Worker 根据能力领取待执行任务，调用本机配置的 Claude Code、Codex 或兼容命令。
 5. 任务不会被两个 Worker 同时领取；Worker 掉线后任务可以重试或超时终止。
 6. Telegram 完全可选，核心系统在无 Token、无真实 Agent 和无外部网络时可测试。
@@ -37,8 +37,9 @@ Telegram 平台默认不会把一个 Bot 发出的消息作为 update 投递给�
    ▼
 Director Bot ── Bearer API ──► Coordinator / FastAPI ──► SQLite
    ▲                                  │                   │
-   │ Telegram 结果推送                ├── 本机 Claude/Codex Planner
-   │                                  │ HMAC API          │ 原子状态更新
+   │ Telegram 结果推送                ├── Bearer API ──► 外部 Codex 主控
+   │                                  │                   codex-with-chatgpt Skill
+   │                                  │                   原子状态更新
    │                                  ▼                   │
    └── notification outbox ◄──── Worker A / B / C ◄──────┘
                                       │
@@ -55,7 +56,7 @@ Coordinator 是唯一控制平面。Worker 主动向 Coordinator 发起出站连
 - 校验 Director Bearer Token 与 Worker HMAC 签名。
 - 保存 Worker 注册、最后心跳和能力元数据。
 - 创建、查询、取消任务；实施任务状态机。
-- 在 Worker 可领取前调用本机 Planner，保存 `plan` 和 `execution_prompt`。
+- 为外部 Codex 主控提供规划任务 claim、lease、PLAN 回写协议，保存 `plan` 和 `execution_prompt`。
 - 用 SQLite `BEGIN IMMEDIATE` 串行化领取事务，防止重复领取。
 - 维护 lease、执行超时、重试次数和失效任务。
 - 在任务进入终态时写入 Telegram 通知 outbox。
@@ -130,8 +131,8 @@ M1 的 Unified Worker 通过 `host.docker.internal:8642` 访问宿主机 Hermes 
 
 1. 用户向 Telegram 发送 `/new` 或普通文本；也可直接调用 API。
 2. Director 根据 `planning_mode` 创建 `planning_pending` 或 `pending` 任务，原始 `prompt` 后续保持不变。
-3. `plan` 模式下 Coordinator 领取本地规划租约，调用所选 Claude/Codex Planner。
-4. 规划成功后持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`；`direct` 模式跳过这两步。
+3. `plan` 模式下，主控 Codex 领取规划租约，按 `codex-with-chatgpt` Skill 的 C2C 流程接收 `INIT`，读取其连接的工作区并生成 `PLAN`。
+4. 主控 Codex 通过 Director API 回写 `PLAN`；Coordinator 持久化 `plan` 和组合后的 `execution_prompt`，任务转为 `pending`；`direct` 模式跳过这两步。
 5. 有空闲容量且兼容 `execution_agent` 的 Worker 发起 claim；若该字段为空则 Worker 使用自身默认 Agent。
 6. Worker 回报 `running`，由 `resolved_execution_agent` 对应的适配器启动本机 Agent 子进程或 Hermes Gateway run。
 7. 心跳持续续租；Coordinator 同时返回待取消任务 ID。
@@ -170,12 +171,14 @@ Unified Worker 的 Gateway route 只执行对应 route 支持的 `hermes`；Code
 | --- | --- |
 | `id` | UUID |
 | `prompt` | 用户原始任务文本，创建后不修改 |
-| `planner_agent` | Coordinator 本地用于生成计划的 Claude 或 Codex |
+| `planner_agent` | 固定为 `codex-with-chatgpt`，表示由主控 Codex Skill 生成计划 |
+| `planner_task_id` | C2C 规划控制任务标识 |
+| `planner_claim_token` | 规划租约凭证，仅在规划 API 内部使用；普通任务查询响应会剥离该字段 |
 | `execution_agent` | 可选；为空时由 Worker 使用默认 Agent |
-| `plan` | Planner 输出的执行计划 |
+| `plan` | `codex-with-chatgpt` Skill 输出的执行计划 |
 | `execution_prompt` | 原始任务与计划组合后的 Worker 输入 |
 | `target_worker_id` | 可选；为空表示任意 Worker |
-| `workdir` | 可选；相对 Worker 允许根目录的路径 |
+| `workdir` | 可选；相对 Worker 允许根目录的路径，Worker 将其作为本地 Agent 的 `cwd` |
 | `timeout_seconds` | 单次任务执行上限 |
 | `max_attempts` | 最大领取/执行次数 |
 | `priority` | 越大越先领取；同优先级按创建时间 |
@@ -205,7 +208,7 @@ Coordinator 校验签名和最大时钟偏差，并把 `(worker_id, nonce)` 原�
 ## 9. 状态机
 
 ```text
-planning_pending ──local claim──► planning ──plan ready──► pending
+planning_pending ──Codex claim──► planning ──PLAN ready──► pending
        │                              │
        └──cancel──► cancelled         ├──failure──► failed
                                       └──timeout──► timed_out
@@ -230,8 +233,8 @@ planning ──lease expiry + attempts remain──► planning_pending
 
 ### 重试
 
-- Planner 领取时独立增加 `planner_attempt_count`；普通非零退出、空计划和超时在规划预算未耗尽时回到 `planning_pending`。
-- Planner 配置错误（未知 Agent、缺少命令、命令不存在或无权限）直接失败，避免无意义重试。
+- 主控 Codex 领取时独立增加 `planner_attempt_count`；规划失败、租约过期且预算未耗尽时回到 `planning_pending`。
+- `codex-with-chatgpt` Skill 在主控会话中执行；Coordinator 不启动本地 Planner CLI，也不模拟 ChatGPT 登录态。
 - claim 成功时 `attempt_count + 1`。
 - Worker 报告 `failed + retryable=true` 且次数未耗尽时，任务回到 `pending`。
 - lease 过期且次数未耗尽时也回到 `pending`。
@@ -246,7 +249,7 @@ planning ──lease expiry + attempts remain──► planning_pending
 
 ### 取消
 
-- `planning_pending`、`planning` 或 `pending` 任务立即变为 `cancelled`；活动 Planner 子进程会被终止。
+- `planning_pending`、`planning` 或 `pending` 任务立即变为 `cancelled`；规划租约失效，主控 Codex 不得继续回写该任务。
 - `claimed/running` 任务变为 `cancel_requested`。
 - Worker 在下次心跳收到任务 ID，终止子进程并回报 `cancelled`。
 - Worker 丢失时，`cancel_requested` 在 lease 过期后由维护逻辑收敛到 `cancelled`。
@@ -263,7 +266,7 @@ Telegram 进程轮询未 ACK 通知，发送成功后再 ACK。因此交付语�
 | --- | --- |
 | `/agents` | 列出 Worker ID、在线状态和并发 |
 | `/tasks` | 列出最近任务、状态、当前阶段和 Worker |
-| `/new [--planner claude|codex] [--agent <agent>] <任务>` | 创建任务并可指定两阶段 Agent |
+| `/new [--planner codex-with-chatgpt] [--worker <id>] [--workdir <目录>] [--agent <agent>] <任务>` | 创建任务；规划固定由主控 Codex Skill 完成 |
 | `@worker-a [-codex\|-cc\|--executor/--agent <agent>] <任务>` | 跳过 Planner，按默认或显式 Agent 定向执行 |
 | `@Coordinator [@worker-a] [-codex\|-cc\|--executor/--agent <agent>] <任务>` | 先规划，再自动或定向执行 |
 | `/status <UUID>` | 查询模式、阶段、attempt、事件和结果/错误 |
@@ -353,6 +356,10 @@ Telegram 进程只需要出站访问 `api.telegram.org`。Worker 只需出站访
 | --- | --- | --- |
 | `GET` | `/api/v1/workers` | Worker 列表与在线状态 |
 | `POST` | `/api/v1/tasks` | 创建任务 |
+| `POST` | `/api/v1/planner/tasks/claim` | 主控 Codex 领取规划任务并取得 C2C `INIT` |
+| `POST` | `/api/v1/tasks/{id}/planning-lease` | 主控 Codex 续规划租约 |
+| `POST` | `/api/v1/tasks/{id}/plan` | 主控 Codex 回写 PLAN，解锁 Worker |
+| `POST` | `/api/v1/tasks/{id}/planning-failure` | 回报规划失败并按预算重试 |
 | `GET` | `/api/v1/tasks` | 最近任务列表 |
 | `GET` | `/api/v1/tasks/{id}` | 任务详情 |
 | `GET` | `/api/v1/tasks/{id}/events` | 任务进度与状态事件 |

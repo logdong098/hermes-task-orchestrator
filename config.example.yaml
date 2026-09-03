@@ -16,27 +16,22 @@ coordinator:
   reconciliation_grace_seconds: 3600
   reconciliation_backoff_seconds: 5
   planner:
-    default_agent: codex
-    commands:
-      claude: [claude, --permission-mode, plan, -p, "{prompt}"]
-      codex: [codex, exec, --sandbox, read-only, "{prompt}"]
-    timeout_seconds: 900
-    poll_interval_seconds: 2
+    # 仅允许由 Codex 主控执行 codex-with-chatgpt Skill
+    default_agent: codex-with-chatgpt
     lease_seconds: 30
     max_attempts: 2
-    max_output_bytes: 2000000
 
 worker:
   coordinator_url: http://127.0.0.1:8000
   id: macbook-worker-01
   name: MacBook Worker 01
   command: [hermes, chat, -q, "{prompt}"]
-  default_agent: hermes
+  default_agent: cc
   # HERMES_WORKER_AGENTS_JSON (or legacy HERMES_AGENT_COMMANDS) supplies
   # per-agent argv templates containing {prompt}. Hermes uses Gateway below.
   agent_commands:
     codex: [codex, exec, "{prompt}"]
-    claude-code: [claude, -p, "{prompt}"]
+    cc: [claude, -p, "{prompt}"]
   allowed_workdir: /absolute/path/to/allowed/workspace
   concurrency: 1
   task_timeout_seconds: 900

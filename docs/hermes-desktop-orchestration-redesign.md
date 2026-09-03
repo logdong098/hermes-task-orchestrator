@@ -19,7 +19,7 @@
 当前工作区已经具备：
 
 - Telegram/API 创建任务。
-- Coordinator 本机 Claude/Codex Planner。
+- 主控 Codex 使用 `codex-with-chatgpt` Skill 规划，Coordinator 只提供规划协议与持久化。
 - `planning_pending -> planning -> pending -> claimed -> running -> terminal` 状态机。
 - SQLite 持久化 `plan`、`execution_prompt`、Planner lease、Worker lease、重试和取消。
 - `target_worker_id` 定向 Worker。
@@ -289,7 +289,7 @@ POST /api/v1/tasks/{parent_task_id}/delegations
 推荐语法：
 
 ```text
-/new --planner codex \
+/new --planner codex-with-chatgpt \
      --gateway homelab \
      --profile architect \
      --executor codex \

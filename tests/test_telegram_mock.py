@@ -42,6 +42,7 @@ class FakeDirector:
         planner_agent=None,
         execution_agent=None,
         target_worker_id=None,
+        workdir=None,
         target_gateway_id=None,
         target_profile=None,
         planning_mode="auto",
@@ -57,6 +58,7 @@ class FakeDirector:
                 target_gateway_id,
                 target_profile,
                 planning_mode,
+                workdir,
             )
         )
         return {
@@ -122,21 +124,33 @@ class TelegramMockTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_routes_planner_and_execution_agent(self) -> None:
         created = await self.bot.handle_text(
-            "/new --planner codex --worker worker-a --gateway homelab "
+            "/new --planner codex-with-chatgpt --worker worker-a --gateway homelab "
             "--profile architect --executor codex implement feature",
             42,
             100,
         )
-        self.assertIn("规划 Agent：codex", created)
+        self.assertIn("规划 Agent：codex-with-chatgpt", created)
         self.assertIn("执行 Agent：codex", created)
         self.assertIn("Worker：worker-a", created)
         self.assertIn("Gateway/Profile：homelab/architect", created)
         self.assertEqual("implement feature", self.director.created[-1][0])
-        self.assertEqual("codex", self.director.created[-1][3])
+        self.assertEqual("codex-with-chatgpt", self.director.created[-1][3])
         self.assertEqual("codex", self.director.created[-1][4])
         self.assertEqual("worker-a", self.director.created[-1][5])
         self.assertEqual("homelab", self.director.created[-1][6])
         self.assertEqual("architect", self.director.created[-1][7])
+
+    async def test_new_routes_worker_workdir(self) -> None:
+        created = await self.bot.handle_text(
+            "/new --worker worker-a --workdir project-a --executor cc "
+            "implement feature",
+            42,
+            100,
+        )
+        self.assertIn("目录：project-a", created)
+        self.assertEqual("worker-a", self.director.created[-1][5])
+        self.assertEqual("project-a", self.director.created[-1][9])
+        self.assertEqual("claude-code", self.director.created[-1][4])
 
     async def test_new_keeps_agent_as_executor_alias(self) -> None:
         created = await self.bot.handle_text(

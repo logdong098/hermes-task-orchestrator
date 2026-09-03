@@ -11,12 +11,13 @@ import httpx
 
 from .config import TelegramSettings
 from .models import canonical_agent_name
+from .planner import C2C_PLANNER_AGENT
 
 LOGGER = logging.getLogger("hermes.telegram")
 HELP_TEXT = """Hermes Director 命令：
 /agents - 查看 Worker 在线状态
 /tasks - 查看最近任务与进度
-/new [--planner claude|codex] [--worker <id>] [--gateway <id> --profile <name>] [--executor <agent>] <任务> - 创建任务
+/new [--planner codex-with-chatgpt] [--worker <id>] [--workdir <目录>] [--gateway <id> --profile <name>] [--executor <agent>] <任务> - 创建任务
 /status <任务ID> - 查询任务
 /cancel <任务ID> - 取消任务
 /help - 显示帮助
@@ -75,6 +76,7 @@ class DirectorAPI:
         planner_agent: Optional[str] = None,
         execution_agent: Optional[str] = None,
         target_worker_id: Optional[str] = None,
+        workdir: Optional[str] = None,
         target_gateway_id: Optional[str] = None,
         target_profile: Optional[str] = None,
         planning_mode: str = "auto",
@@ -91,6 +93,7 @@ class DirectorAPI:
                 "planning_mode": planning_mode,
                 "execution_agent": execution_agent,
                 "target_worker_id": target_worker_id,
+                "workdir": workdir,
                 "target_gateway_id": target_gateway_id,
                 "target_profile": target_profile,
             },
@@ -239,21 +242,24 @@ class DirectorBot:
         if command == "/new":
             if not argument:
                 return (
-                    "用法：/new [--planner claude|codex] [--worker <id>] "
-                    "[--gateway <id> --profile <name>] [--executor <agent>] <任务描述>"
+                    "用法：/new [--planner codex-with-chatgpt] [--worker <id>] "
+                    "[--workdir <目录>] [--gateway <id> --profile <name>] "
+                    "[--executor <agent>] <任务描述>"
                 )
             parsed = self._parse_new_arguments(argument)
             if parsed is None:
                 return (
                     "参数错误。Gateway 与 Profile 必须同时指定。\n"
-                    "用法：/new [--planner claude|codex] [--worker <id>] "
-                    "[--gateway <id> --profile <name>] [--executor <agent>] <任务描述>"
+                    "用法：/new [--planner codex-with-chatgpt] [--worker <id>] "
+                    "[--workdir <目录>] [--gateway <id> --profile <name>] "
+                    "[--executor <agent>] <任务描述>"
                 )
             (
                 prompt,
                 planner_agent,
                 execution_agent,
                 target_worker_id,
+                workdir,
                 target_gateway_id,
                 target_profile,
             ) = parsed
@@ -265,6 +271,7 @@ class DirectorBot:
                 planner_agent=planner_agent,
                 execution_agent=execution_agent,
                 target_worker_id=target_worker_id,
+                workdir=workdir,
                 target_gateway_id=target_gateway_id,
                 target_profile=target_profile,
                 planning_mode="auto",
@@ -275,6 +282,7 @@ class DirectorBot:
                 target_worker_id,
                 target_gateway_id,
                 target_profile,
+                workdir,
             )
             suffix = f"\n{detail}" if detail else ""
             return f"{self._format_created_task(task)}{suffix}"
@@ -513,6 +521,7 @@ class DirectorBot:
             Optional[str],
             Optional[str],
             Optional[str],
+            Optional[str],
         ]
     ]:
         """Parse the optional routing flags without creating a task on errors."""
@@ -523,6 +532,7 @@ class DirectorBot:
         planner_agent: Optional[str] = None
         execution_agent: Optional[str] = None
         target_worker_id: Optional[str] = None
+        workdir: Optional[str] = None
         target_gateway_id: Optional[str] = None
         target_profile: Optional[str] = None
         index = 0
@@ -533,6 +543,7 @@ class DirectorBot:
                 "--agent",
                 "--executor",
                 "--worker",
+                "--workdir",
                 "--gateway",
                 "--profile",
             ) or index + 1 >= len(tokens):
@@ -541,7 +552,7 @@ class DirectorBot:
             if not value or value.startswith("--"):
                 return None
             if option == "--planner":
-                if planner_agent is not None or value not in ("claude", "codex"):
+                if planner_agent is not None or value != C2C_PLANNER_AGENT:
                     return None
                 planner_agent = value
             elif option in ("--agent", "--executor"):
@@ -552,6 +563,10 @@ class DirectorBot:
                 if target_worker_id is not None:
                     return None
                 target_worker_id = value
+            elif option == "--workdir":
+                if workdir is not None:
+                    return None
+                workdir = value
             elif option == "--gateway":
                 if target_gateway_id is not None:
                     return None
@@ -570,6 +585,7 @@ class DirectorBot:
             planner_agent,
             execution_agent,
             target_worker_id,
+            workdir,
             target_gateway_id,
             target_profile,
         )
@@ -581,6 +597,7 @@ class DirectorBot:
         worker_id: Optional[str] = None,
         gateway_id: Optional[str] = None,
         profile: Optional[str] = None,
+        workdir: Optional[str] = None,
     ) -> str:
         values = []
         if planner_agent:
@@ -591,6 +608,8 @@ class DirectorBot:
             values.append(f"Worker：{worker_id}")
         if gateway_id and profile:
             values.append(f"Gateway/Profile：{gateway_id}/{profile}")
+        if workdir:
+            values.append(f"目录：{workdir}")
         return " | ".join(values)
 
     def load_offset(self) -> Optional[int]:

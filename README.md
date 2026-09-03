@@ -1,6 +1,6 @@
 # hermes
 
-`hermes` 是一个可运行的分布式开发任务调度 MVP：用户通过 Telegram Director Bot 或 API 提交任务，简单任务可直接交给 Worker，复杂任务可先由 Coordinator 在本机调用 Claude Code 或 Codex 生成执行计划，再可靠地分配给 Worker。用户可以指定执行 Agent；未指定时由领取任务的 Worker 使用本机默认 Agent。
+`hermes` 是一个可运行的分布式开发任务调度 MVP：用户通过 Telegram Director Bot 或 API 提交任务，复杂任务由主控 Codex 强制使用 `codex-with-chatgpt` Skill 生成执行计划，再可靠地分配给 Worker。Worker 在指定目录调用 Claude Code（`cc`）或其他配置的执行 Agent；简单任务可以显式跳过规划。
 
 核心 Coordinator 与 Worker 不依赖 Telegram。没有 Bot Token、没有真实 Hermes CLI 时，也可以使用内置 mock 完成测试和端到端流程。
 
@@ -8,7 +8,7 @@
 
 ## 组件
 
-- `coordinator`：FastAPI + SQLite，负责认证 API、任务状态机，并在本机运行 Claude/Codex Planner。
+- `coordinator`：FastAPI + SQLite，负责认证 API、任务状态机，以及外部 Codex with ChatGPT 规划协议。
 - `worker`：单一 Worker 进程，按默认或任务指定的 Agent 分流；Hermes 任务走 Gateway，Codex/Claude Code 任务启动本机 CLI，并统一负责心跳、取消、状态和结果回传。
 - `telegram`：单个 Director Bot，提供 `/agents`、`/tasks`、`/new`、`/status`、`/cancel`、`/help`，并推送结果。
 - `mock_hermes`：不访问外部服务的假 Hermes 命令，仅用于开发和测试。
@@ -17,7 +17,7 @@
 
 ## 从零启动
 
-要求 Python 3.9+。真实 Worker 还需要本机已安装可用的 `hermes` 命令。
+要求 Python 3.9+。真实 Worker 还需要本机已安装可用的执行 Agent；按本文示例为 Claude Code（`cc`）。
 
 ```bash
 cd /Users/log/Documents/hermes
@@ -44,7 +44,8 @@ install -m 600 /path/to/role-specific.env /opt/hermes/.env
 
 | 机器/进程 | 必需配置 | 启动命令 |
 | --- | --- | --- |
-| Coordinator | 数据库、Director key、Worker secret、Planner 命令 | `hermes-coordinator` |
+| Coordinator | 数据库、Director key、Worker secret | `hermes-coordinator` |
+| Codex 主控 | Coordinator URL、Director key、当前项目的 Codex with ChatGPT 连接 | 由 Codex 会话执行 Skill |
 | Unified Worker | Coordinator URL、Worker ID/secret、Agent 命令、Gateway URL/Profiles 和各 Profile key | `hermes-worker` |
 | 兼容 Gateway Worker | 同上，仅保留旧配置/入口兼容 | `hermes-gateway-worker` |
 | Telegram（可选） | Coordinator URL、Director key、Bot Token、用户 allowlist | `hermes-telegram` |
@@ -66,20 +67,22 @@ HERMES_WORKER_SHARED_SECRET=<第二个随机值>
 HERMES_WORKER_ALLOWED_WORKDIR=/Users/log/Documents/hermes
 ```
 
-Coordinator 默认使用本机 Codex 规划；也可以将默认 Planner 改为 Claude：
+Coordinator 不启动本地 Planner CLI。所有非 `direct` 任务都固定进入 `codex-with-chatgpt` 规划队列；主控 Codex 使用该 Skill 完成 `INIT → PLAN`，再把计划回写 Coordinator：
 
-```dotenv
-HERMES_PLANNER_DEFAULT_AGENT=codex
-HERMES_PLANNER_COMMANDS_JSON={"claude":["claude","--permission-mode","plan","-p","{prompt}"],"codex":["codex","exec","--sandbox","read-only","{prompt}"]}
+```text
+POST /api/v1/planner/tasks/claim
+POST /api/v1/tasks/<TASK_ID>/plan
 ```
 
-默认模板把 Claude 固定为 `plan` 权限模式、把 Codex 固定为 `read-only` sandbox，Planner 只负责读取上下文并输出执行计划。覆盖命令时应保留等价的只读限制；真正的文件修改只在 Worker 执行阶段发生。
+主控必须实际执行 `codex-with-chatgpt` Skill；Hermes 不会把普通 `codex exec`、ChatGPT 登录态或本地 Planner 输出伪装成该 Skill。规划结果保存到任务的 `plan` 字段，并组合成 Worker 的 `execution_prompt`。
+
+主控和 Worker 可以使用不同的本地目录：ChatGPT 通过当前 Codex workspace 读取项目，Worker 在 `HERMES_WORKER_ALLOWED_WORKDIR` 下解析任务的 `workdir`，并把该目录作为 `cc` 的 `cwd`。例如 Worker 根目录是 `/srv/code` 时，Telegram 使用 `/new --worker worker-a --workdir project-a --executor cc 实现功能`，实际执行目录就是 `/srv/code/project-a`。两份代码不会由 Hermes 自动同步；如果主控和 Worker 是两份独立副本，需要自行保持版本/文件一致，或使用共享文件系统/版本同步。`workdir` 只允许位于 Worker 根目录内，越界或不存在会被拒绝。
 
 Unified Worker 未收到 `execution_agent` 时使用 `HERMES_WORKER_DEFAULT_AGENT`。本地 Codex/Claude Code 使用 Agent 命令映射；Hermes 使用 Gateway 配置：
 
 ```dotenv
-HERMES_WORKER_DEFAULT_AGENT=hermes
-HERMES_WORKER_AGENTS_JSON={"codex":["codex","exec","{prompt}"],"claude-code":["claude","-p","{prompt}"]}
+HERMES_WORKER_DEFAULT_AGENT=cc
+HERMES_WORKER_AGENTS_JSON={"cc":["claude","-p","{prompt}"],"codex":["codex","exec","{prompt}"]}
 HERMES_GATEWAY_URL=http://127.0.0.1:8642
 HERMES_GATEWAY_ID=local-hermes
 HERMES_GATEWAY_PROFILES=default
@@ -97,9 +100,7 @@ HERMES_AGENT_COMMANDS={"cc":["claude","-p","{prompt}","--dangerously-skip-permis
 
 该选项只应在受控 Worker 工作目录启用，并遵循 Claude Code 当前版本的 deny 规则与安全策略。
 
-Coordinator 主机必须安装并能运行所配置的 Planner CLI；Worker 主机只需安装自己映射中的执行 Agent。`HERMES_WORKER_COMMAND` 继续作为默认 Agent 的兼容入口，无需一次性改造旧部署。
-
-Planner 子进程不会继承名称中含 `KEY`、`SECRET`、`TOKEN` 或 `PASSWORD` 的 `HERMES_*` 变量，避免读取 Coordinator/Worker/Gateway 凭据。Planner 登录请使用 Codex/Claude 自身的登录状态或其原生 provider 环境变量，不要复用 Hermes 控制面密钥。
+Coordinator 主机不需要安装 Planner CLI；主控 Codex 需要能使用当前项目的 `codex-with-chatgpt` Skill。Worker 主机只需安装自己映射中的执行 Agent。`HERMES_WORKER_COMMAND` 继续作为默认 Agent 的兼容入口。
 
 现有 SQLite 数据库启动时会原地增加规划字段，不会重建表，也不会把已经存在的 `pending/claimed/running` 任务重新送去规划；这些旧任务继续使用原始 `prompt` 执行。
 
@@ -163,7 +164,7 @@ hermes-worker
 
 每个 Profile 使用独立 key；`target_gateway_id` 与 `target_profile` 必须同时指定。任务被 Coordinator 精确解析后，Unified Worker 会把 resolved Profile 传给 Hermes API，不会把同 Gateway 的其他 Profile 当作 fallback。没有 Gateway/Profile 定位时，只有单个 Profile 或显式默认 Profile 才会执行默认 Hermes 任务，避免随机选择错误 Profile。关闭 Desktop 不影响这条生产路径。
 
-`--planner claude` 只选择 Coordinator 本机的规划程序，不会改变执行 Agent。执行任务时由同一个 Unified Worker 按默认配置或显式覆盖选择后端：
+`--planner` 不选择本地 CLI；规划始终由主控 Codex 使用 `codex-with-chatgpt` Skill 完成。执行任务时由同一个 Unified Worker 按默认配置或显式覆盖选择后端：
 
 ```text
 @<worker-id> <任务>             # 使用 Worker 默认 Agent
@@ -207,13 +208,13 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
 
 `planning_mode` 可取 `auto`、`plan`、`direct`；`direct` 不能同时指定 `planner_agent`。
 
-指定 Planner 和执行 Agent：
+指定执行 Agent（规划固定由主控 Codex Skill 完成）：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Authorization: Bearer ${DIRECTOR_KEY}" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"实现并测试健康检查接口","planner_agent":"claude","execution_agent":"codex"}'
+  -d '{"prompt":"实现并测试健康检查接口","planner_agent":"codex-with-chatgpt","execution_agent":"cc"}'
 ```
 
 `execution_agent` 省略或为 `null` 时，任务可由任意匹配 Worker 领取，并由该 Worker 使用自己的默认 Agent。
@@ -257,7 +258,7 @@ curl -sS http://127.0.0.1:8000/api/v1/workers \
   -H "Authorization: Bearer ${DIRECTOR_KEY}"
 ```
 
-交互式 OpenAPI 文档位于 `http://127.0.0.1:8000/docs`，健康检查为 `GET /healthz`。
+交互式 OpenAPI 文档位于 `http://127.0.0.1:8000/docs`，健康检查为 `GET /healthz`。规划控制器使用 Director key 调用规划领取、租约续期和计划回写接口。
 
 ## 启动 Telegram Director
 
@@ -281,7 +282,7 @@ Telegram Bot 默认收不到其他 Bot 发送的消息。因此本项目不把�
 创建任务既支持兼容的 `/new` 参数，也支持更短的 `@` 指令：
 
 ```text
-/new [--planner claude|codex] [--agent <agent>] <任务描述>
+/new [--planner codex-with-chatgpt] [--worker <id>] [--workdir <目录>] [--agent <agent>] <任务描述>
 @worker 修复登录页文案并运行相关测试
 @worker -cc 修复登录页文案并运行相关测试
 @worker -codex 修复登录页文案并运行相关测试
@@ -295,7 +296,7 @@ Telegram Bot 默认收不到其他 Bot 发送的消息。因此本项目不把�
 M1 Telegram 路由语法为：
 
 ```text
-/new --planner codex --gateway mac-hermes --profile architect --executor hermes 检查工作区
+/new --planner codex-with-chatgpt --gateway mac-hermes --profile architect --executor hermes 检查工作区
 ```
 
 `--executor` 是执行器；旧的 `--agent` 仍作为兼容别名。`--gateway` 和 `--profile` 必须成对出现。
@@ -391,7 +392,7 @@ sqlite3 data/hermes.db ".backup 'data/hermes.db.backup-$(date +%Y%m%d%H%M%S)'"
 - Coordinator 只保存 route 标识和能力，不保存 Gateway/SSH/OAuth 凭据。
 - Hermes Desktop 连接注册表和凭据不被本项目读取；Desktop 退出不影响 headless Worker。
 
-基础 Docker 镜像不安装 Codex/Claude CLI，因此 Compose 默认使用内置 mock Planner，只用于安装验证和本地联调。生产 Coordinator 应优先在已安装并登录 Planner CLI 的宿主机运行；若必须容器化，请构建包含所选 Planner CLI 和受控认证挂载的派生镜像，并通过 `.env` 覆盖 `HERMES_PLANNER_DEFAULT_AGENT` 与 `HERMES_PLANNER_COMMANDS_JSON`。不要把 Planner 登录凭据烘焙进镜像。
+基础 Docker 镜像不安装 Codex/Claude CLI；Compose 只启动 Coordinator 和可选 mock Worker。生产环境需要让主控 Codex 使用当前项目的 `codex-with-chatgpt` Skill，并通过规划 API 把 PLAN 回写 Coordinator。不要把 ChatGPT 连接凭据或 Planner 会话状态烘焙进镜像。
 
 启用 Telegram profile：
 
@@ -417,7 +418,7 @@ src/hermes/
   coordinator.py    FastAPI 应用与 API 鉴权
   gateway_adapter.py Hermes profile-scoped Runs API 客户端
   gateway_worker.py 旧 Gateway Worker 兼容入口
-  planner.py        Coordinator 本地规划子进程与计划产物
+  planner.py        Codex with ChatGPT 规划协议与回写客户端
   storage.py        SQLite Repository、原子领取和状态机
   worker.py         Unified Worker 控制环、Agent 分流和子进程执行器
   telegram_bot.py   Telegram 长轮询与命令处理

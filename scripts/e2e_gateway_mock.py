@@ -33,6 +33,32 @@ def wait_until_healthy(base_url: str) -> None:
     raise RuntimeError("coordinator did not become healthy")
 
 
+def complete_external_plan(
+    base_url: str, headers: dict[str, str], task_id: str, plan: str
+) -> None:
+    claimed = httpx.post(
+        f"{base_url}/api/v1/planner/tasks/claim",
+        headers=headers,
+        timeout=5,
+    )
+    claimed.raise_for_status()
+    planning_task = claimed.json()["task"]
+    if planning_task["id"] != task_id:
+        raise RuntimeError(f"unexpected planning task: {planning_task}")
+    submitted = httpx.post(
+        f"{base_url}/api/v1/tasks/{task_id}/plan",
+        json={
+            "planner_claim_token": planning_task["planner_claim_token"],
+            "plan": plan,
+        },
+        headers=headers,
+        timeout=5,
+    )
+    submitted.raise_for_status()
+    if submitted.json()["status"] != "pending":
+        raise RuntimeError(f"task was not planned: {submitted.json()}")
+
+
 class FakeGatewayHandler(BaseHTTPRequestHandler):
     api_key = "e2e-profile-key"
     prompt = ""
@@ -171,18 +197,6 @@ def main() -> None:
                 "HERMES_GATEWAY_WORKER_POLL_INTERVAL_SECONDS": "0.05",
                 "HERMES_GATEWAY_POLL_INTERVAL_SECONDS": "0.05",
                 "HERMES_GATEWAY_HEARTBEAT_INTERVAL_SECONDS": "1",
-                "HERMES_PLANNER_POLL_INTERVAL_SECONDS": "0.05",
-                "HERMES_PLANNER_DEFAULT_AGENT": "codex",
-                "HERMES_PLANNER_COMMANDS_JSON": json.dumps(
-                    {
-                        "codex": [
-                            sys.executable,
-                            "-c",
-                            "import sys; print('plan: ' + sys.argv[1])",
-                            "{prompt}",
-                        ]
-                    }
-                ),
             }
         )
         coordinator = subprocess.Popen(
@@ -218,6 +232,12 @@ def main() -> None:
             )
             created.raise_for_status()
             task_id = created.json()["id"]
+            complete_external_plan(
+                coordinator_url,
+                headers,
+                task_id,
+                "Run the Gateway request in the assigned workspace and verify the result.",
+            )
             for _ in range(100):
                 planned = httpx.get(
                     f"{coordinator_url}/api/v1/tasks/{task_id}",
@@ -263,12 +283,14 @@ def main() -> None:
             }
             if mismatches:
                 raise RuntimeError(f"task audit mismatch: {mismatches}; task={task}")
-            if (
-                not task["result"].startswith(
+            result_text = task["result"]
+            if not (
+                result_text.startswith(
                     "gateway: Original development task:\nheadless gateway hello"
                 )
-                or "Coordinator execution plan:\nplan: headless gateway hello"
-                not in task["result"]
+                and "Codex with ChatGPT execution plan:\nRun the Gateway request"
+                in result_text
+                and "Implement the task in the assigned workspace" in result_text
             ):
                 raise RuntimeError(f"unexpected result: {task['result']!r}")
             print(
@@ -291,6 +313,12 @@ def main() -> None:
             )
             cancel_created.raise_for_status()
             cancel_task_id = cancel_created.json()["id"]
+            complete_external_plan(
+                coordinator_url,
+                headers,
+                cancel_task_id,
+                "Run the Gateway request and stop it when cancellation is requested.",
+            )
             for _ in range(100):
                 planned = httpx.get(
                     f"{coordinator_url}/api/v1/tasks/{cancel_task_id}",

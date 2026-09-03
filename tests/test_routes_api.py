@@ -40,6 +40,14 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
             headers["Content-Type"] = "application/json"
         return await self.client.post(path, content=body, headers=headers)
 
+    async def command_worker_post(self, path: str, payload=None) -> httpx.Response:
+        body = compact_json(payload)
+        headers = sign_request("worker-test-secret", "POST", path, body)
+        headers["X-Hermes-Worker-ID"] = "command-worker"
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        return await self.client.post(path, content=body, headers=headers)
+
     async def register_gateway_worker(self) -> httpx.Response:
         return await self.worker_post(
             "/api/v1/workers/register",
@@ -96,6 +104,79 @@ class RouteAPITests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(201, response.status_code, response.text)
         self.assertEqual("claude-code", response.json()["execution_agent"])
+
+    async def test_codex_with_chatgpt_plan_round_trip_unlocks_worker(self) -> None:
+        created = await self.client.post(
+            "/api/v1/tasks",
+            json={
+                "prompt": "implement the feature",
+                "execution_agent": "cc",
+            },
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(201, created.status_code, created.text)
+        task_id = created.json()["id"]
+        self.assertEqual("planning_pending", created.json()["status"])
+        self.assertEqual("codex-with-chatgpt", created.json()["planner_agent"])
+
+        unauthorized = await self.client.post("/api/v1/planner/tasks/claim")
+        self.assertEqual(401, unauthorized.status_code)
+
+        claimed = await self.client.post(
+            "/api/v1/planner/tasks/claim",
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(200, claimed.status_code, claimed.text)
+        planning_task = claimed.json()["task"]
+        self.assertEqual(task_id, planning_task["id"])
+        self.assertEqual("codex-with-chatgpt", claimed.json()["protocol"]["name"])
+        self.assertIn("STATE: INIT", claimed.json()["protocol"]["init"])
+        self.assertTrue(planning_task["planner_claim_token"])
+
+        rejected = await self.client.post(
+            f"/api/v1/tasks/{task_id}/plan",
+            json={
+                "planner_claim_token": "x" * 32,
+                "plan": "stale plan",
+            },
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(409, rejected.status_code, rejected.text)
+
+        planned = await self.client.post(
+            f"/api/v1/tasks/{task_id}/plan",
+            json={
+                "planner_claim_token": planning_task["planner_claim_token"],
+                "plan": "Edit the feature and run the regression tests.",
+            },
+            headers={"Authorization": "Bearer director-test-key"},
+        )
+        self.assertEqual(200, planned.status_code, planned.text)
+        self.assertEqual("pending", planned.json()["status"])
+        self.assertEqual(
+            "Edit the feature and run the regression tests.", planned.json()["plan"]
+        )
+        self.assertIn("Original development task", planned.json()["execution_prompt"])
+
+        registered = await self.command_worker_post(
+            "/api/v1/workers/register",
+            {
+                "worker_id": "command-worker",
+                "name": "Command Worker",
+                "max_concurrency": 1,
+                "capabilities": ["agent:claude-code"],
+                "metadata": {"default_agent": "claude-code"},
+            },
+        )
+        self.assertEqual(200, registered.status_code, registered.text)
+        worker_claim = await self.command_worker_post(
+            "/api/v1/workers/command-worker/tasks/claim"
+        )
+        self.assertEqual(200, worker_claim.status_code, worker_claim.text)
+        self.assertEqual(task_id, worker_claim.json()["task"]["id"])
+        self.assertEqual(
+            "claude-code", worker_claim.json()["task"]["resolved_execution_agent"]
+        )
 
     async def test_routes_require_director_auth_and_are_non_secret(self) -> None:
         response = await self.register_gateway_worker()

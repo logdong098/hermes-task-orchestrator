@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import time
 import uuid
@@ -115,6 +117,8 @@ class SQLiteStore:
                     telegram_chat_id TEXT,
                     idempotency_key TEXT,
                     planner_agent TEXT,
+                    planner_task_id TEXT,
+                    planner_claim_token TEXT,
                     planning_mode TEXT NOT NULL DEFAULT 'auto',
                     execution_agent TEXT,
                     plan TEXT,
@@ -223,6 +227,8 @@ class SQLiteStore:
                 connection.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
             additive_task_columns = {
                 "planner_agent": "TEXT",
+                "planner_task_id": "TEXT",
+                "planner_claim_token": "TEXT",
                 "planning_mode": "TEXT NOT NULL DEFAULT 'auto'",
                 "execution_agent": "TEXT",
                 "plan": "TEXT",
@@ -256,6 +262,13 @@ class SQLiteStore:
                     ELSE 'direct'
                 END
                 WHERE planning_mode IS NULL OR planning_mode = 'auto'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET planner_agent = 'codex-with-chatgpt'
+                WHERE planning_mode = 'plan'
                 """
             )
             connection.execute(
@@ -342,6 +355,20 @@ class SQLiteStore:
             raise ConflictError("task belongs to another worker")
         if not claim_token or row["claim_token"] != claim_token:
             raise ConflictError("task claim is stale")
+
+    @staticmethod
+    def _require_planner_claim(
+        row: sqlite3.Row, planner_claim_token: Optional[str], now: float
+    ) -> None:
+        if not planner_claim_token or not row["planner_claim_token"]:
+            raise ConflictError("planner claim is missing")
+        if not hmac.compare_digest(row["planner_claim_token"], planner_claim_token):
+            raise ConflictError("planner claim is stale")
+        if (
+            row["planner_lease_expires_at"] is None
+            or row["planner_lease_expires_at"] <= now
+        ):
+            raise ConflictError("planner lease has expired")
 
     @staticmethod
     def _event(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1209,7 +1236,7 @@ class SQLiteStore:
         task_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Atomically lease the next Coordinator-local planning task."""
+        """Atomically lease the next task for the external Codex planner."""
         current = now if now is not None else time.time()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1232,18 +1259,23 @@ class SQLiteStore:
             if row is None:
                 connection.commit()
                 return None
+            planner_claim_token = secrets.token_urlsafe(32)
+            planner_task_id = f"c2c_{secrets.token_hex(16)}"
             cursor = connection.execute(
                 """
                 UPDATE tasks
                 SET status = ?, planner_attempt_count = planner_attempt_count + 1,
                     planner_started_at = COALESCE(planner_started_at, ?),
-                    planner_lease_expires_at = ?, updated_at = ?
+                    planner_lease_expires_at = ?, planner_claim_token = ?,
+                    planner_task_id = ?, updated_at = ?
                 WHERE id = ? AND status = ?
                 """,
                 (
                     TaskStatus.PLANNING.value,
                     current,
                     current + lease_seconds,
+                    planner_claim_token,
+                    planner_task_id,
                     current,
                     row["id"],
                     TaskStatus.PLANNING_PENDING.value,
@@ -1265,7 +1297,11 @@ class SQLiteStore:
                 current,
                 phase="planning",
                 status=TaskStatus.PLANNING.value,
-                details={"attempt": row["planner_attempt_count"] + 1},
+                details={
+                    "attempt": row["planner_attempt_count"] + 1,
+                    "planner": "codex-with-chatgpt",
+                    "planner_task_id": planner_task_id,
+                },
             )
             claimed = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (row["id"],)
@@ -1277,16 +1313,24 @@ class SQLiteStore:
         self,
         task_id: str,
         lease_seconds: int,
+        planner_claim_token: Optional[str] = None,
         now: Optional[float] = None,
         expected_attempt_count: Optional[int] = None,
     ) -> bool:
         current = now if now is not None else time.time()
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("task not found")
+            self._require_planner_claim(row, planner_claim_token, current)
             cursor = connection.execute(
                 """
                 UPDATE tasks SET planner_lease_expires_at = ?, updated_at = ?
                 WHERE id = ? AND status = ?
                   AND planner_lease_expires_at >= ?
+                  AND planner_claim_token = ?
                   AND (? IS NULL OR planner_attempt_count = ?)
                 """,
                 (
@@ -1295,6 +1339,7 @@ class SQLiteStore:
                     task_id,
                     TaskStatus.PLANNING.value,
                     current,
+                    planner_claim_token,
                     expected_attempt_count,
                     expected_attempt_count,
                 ),
@@ -1306,6 +1351,7 @@ class SQLiteStore:
         task_id: str,
         plan: str,
         execution_prompt: str,
+        planner_claim_token: Optional[str] = None,
         now: Optional[float] = None,
         expected_attempt_count: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1327,6 +1373,7 @@ class SQLiteStore:
                 raise ConflictError(
                     f"invalid transition: {row['status']} -> {TaskStatus.PENDING.value}"
                 )
+            self._require_planner_claim(row, planner_claim_token, current)
             if (
                 expected_attempt_count is not None
                 and row["planner_attempt_count"] != expected_attempt_count
@@ -1337,6 +1384,7 @@ class SQLiteStore:
                 """
                 UPDATE tasks SET status = ?, plan = ?, execution_prompt = ?,
                     planner_finished_at = ?, planner_lease_expires_at = NULL,
+                    planner_claim_token = NULL,
                     error = NULL, updated_at = ?, current_phase = ?,
                     last_progress_at = ?
                 WHERE id = ?
@@ -1360,6 +1408,10 @@ class SQLiteStore:
                 phase="queued",
                 status=TaskStatus.PENDING.value,
                 message="plan ready; task queued for execution",
+                details={
+                    "planner": "codex-with-chatgpt",
+                    "planner_task_id": row["planner_task_id"],
+                },
             )
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -1373,6 +1425,7 @@ class SQLiteStore:
         status: str,
         error: str,
         retryable: bool = False,
+        planner_claim_token: Optional[str] = None,
         now: Optional[float] = None,
         expected_attempt_count: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1394,6 +1447,7 @@ class SQLiteStore:
             if row["status"] != TaskStatus.PLANNING.value:
                 connection.rollback()
                 raise ConflictError(f"cannot fail planner from {row['status']}")
+            self._require_planner_claim(row, planner_claim_token, current)
             if (
                 expected_attempt_count is not None
                 and row["planner_attempt_count"] != expected_attempt_count
@@ -1404,6 +1458,7 @@ class SQLiteStore:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
+                        planner_claim_token = NULL,
                         error = ?, updated_at = ?, current_phase = ?,
                         last_progress_at = ? WHERE id = ?
                     """,
@@ -1429,7 +1484,8 @@ class SQLiteStore:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_finished_at = ?,
-                        planner_lease_expires_at = NULL, finished_at = ?,
+                        planner_lease_expires_at = NULL, planner_claim_token = NULL,
+                        finished_at = ?,
                         error = ?, updated_at = ?, current_phase = ?,
                         last_progress_at = ? WHERE id = ?
                     """,
@@ -1848,6 +1904,7 @@ class SQLiteStore:
                 """
                 UPDATE tasks SET status = ?, updated_at = ?, finished_at = ?,
                     current_phase = ?, last_progress_at = ?, cancel_requested_at = ?,
+                    planner_lease_expires_at = NULL, planner_claim_token = NULL,
                     reconciliation_next_attempt_at = ?
                 WHERE id = ?
                 """,
@@ -1937,6 +1994,7 @@ class SQLiteStore:
                 connection.execute(
                     """
                     UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
+                        planner_claim_token = NULL,
                         updated_at = ?, error = ?, current_phase = ?,
                         last_progress_at = ? WHERE id = ?
                     """,
@@ -1962,6 +2020,7 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE tasks SET status = ?, planner_lease_expires_at = NULL,
+                    planner_claim_token = NULL,
                     planner_finished_at = ?, finished_at = ?, updated_at = ?,
                     error = COALESCE(error, ?), current_phase = ?,
                     last_progress_at = ? WHERE id = ?
