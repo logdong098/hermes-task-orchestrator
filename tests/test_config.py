@@ -91,6 +91,30 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(["default", "architect"], settings.profiles)
 
+    def test_unified_settings_loads_headless_claude_command_alias(self) -> None:
+        command = [
+            "claude",
+            "-p",
+            "{prompt}",
+            "--dangerously-skip-permissions",
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_ENV_FILE": str(Path(temporary_directory) / "missing.env"),
+                    "HERMES_WORKER_ID": "windows-worker",
+                    "HERMES_WORKER_SHARED_SECRET": "worker-secret",
+                    "HERMES_WORKER_DEFAULT_AGENT": "cc",
+                    "HERMES_AGENT_COMMANDS": json.dumps({"cc": command}),
+                },
+                clear=True,
+            ):
+                settings = UnifiedWorkerSettings.from_env()
+
+        self.assertEqual("claude-code", settings.default_agent)
+        self.assertEqual(command, settings.agent_commands["claude-code"])
+
 
 if __name__ == "__main__":
     unittest.main()

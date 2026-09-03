@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import platform
+import shutil
 import signal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -34,6 +35,16 @@ def build_execution_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]
 
 def normalize_process_output(value: str) -> str:
     return value.replace("\r\n", "\n")
+
+
+def resolve_command_for_platform(command: List[str]) -> List[str]:
+    """Resolve Windows command shims before passing argv to CreateProcess."""
+    if os.name != "nt" or not command:
+        return command
+    executable = shutil.which(command[0])
+    if executable is None:
+        return command
+    return [executable, *command[1:]]
 
 
 class WorkerAPI:
@@ -331,7 +342,9 @@ class WorkerRuntime:
             )
             workdir = self.resolve_workdir(task.get("workdir"))
             prompt = task.get("execution_prompt") or task["prompt"]
-            command = self.command_for(prompt, task.get("execution_agent"))
+            command = resolve_command_for_platform(
+                self.command_for(prompt, task.get("execution_agent"))
+            )
             LOGGER.info("starting task %s in %s", task_id, workdir)
             process_options: Dict[str, Any] = {}
             if os.name == "posix":
@@ -494,7 +507,11 @@ class WorkerRuntime:
             while not self.stopping.is_set():
                 claimed_any = False
                 while len(self.active) < self.settings.concurrency:
-                    task = await self.api.claim()
+                    try:
+                        task = await self.api.claim()
+                    except httpx.ReadTimeout:
+                        LOGGER.warning("claim request timed out; retrying")
+                        continue
                     if task is None:
                         break
                     claimed_any = True
@@ -691,7 +708,11 @@ class UnifiedWorkerRuntime:
             while not self.stopping.is_set():
                 claimed_any = False
                 while len(self.active) < self.settings.concurrency:
-                    task = await self.api.claim()
+                    try:
+                        task = await self.api.claim()
+                    except httpx.ReadTimeout:
+                        LOGGER.warning("claim request timed out; retrying")
+                        continue
                     if task is None:
                         break
                     claimed_any = True

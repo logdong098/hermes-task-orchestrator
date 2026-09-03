@@ -579,7 +579,11 @@ class GatewayWorker:
             while not self.stopping.is_set():
                 claimed = False
                 while len(self.active) < self.settings.concurrency:
-                    task = await self.api.claim()
+                    try:
+                        task = await self.api.claim()
+                    except httpx.ReadTimeout:
+                        LOGGER.warning("claim request timed out; retrying")
+                        continue
                     if not task:
                         break
                     claimed = True

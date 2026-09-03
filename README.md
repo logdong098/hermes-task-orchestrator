@@ -89,6 +89,14 @@ HERMES_GATEWAY_PROFILE_KEYS_JSON={"default":"<profile-key>"}
 
 旧部署也可将同样格式配置在 `HERMES_AGENT_COMMANDS`；`hermes-worker` 会将它作为兼容别名读取。`claude`/`cc` 是 `claude-code` 的兼容别名，新的稳定 Agent ID 是 `claude-code`。
 
+Windows 上 npm 安装的 Claude Code 可能是 `claude.cmd`。Worker 会在创建子进程前用系统 PATH 解析命令 shim，避免 `create_subprocess_exec("claude")` 无法启动。若使用 headless Claude Code 并需要跳过交互式 allow 审批，可在 Worker 机器的 `.env` 中配置：
+
+```dotenv
+HERMES_AGENT_COMMANDS={"cc":["claude","-p","{prompt}","--dangerously-skip-permissions"]}
+```
+
+该选项只应在受控 Worker 工作目录启用，并遵循 Claude Code 当前版本的 deny 规则与安全策略。
+
 Coordinator 主机必须安装并能运行所配置的 Planner CLI；Worker 主机只需安装自己映射中的执行 Agent。`HERMES_WORKER_COMMAND` 继续作为默认 Agent 的兼容入口，无需一次性改造旧部署。
 
 Planner 子进程不会继承名称中含 `KEY`、`SECRET`、`TOKEN` 或 `PASSWORD` 的 `HERMES_*` 变量，避免读取 Coordinator/Worker/Gateway 凭据。Planner 登录请使用 Codex/Claude 自身的登录状态或其原生 provider 环境变量，不要复用 Hermes 控制面密钥。

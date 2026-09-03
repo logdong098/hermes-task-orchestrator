@@ -119,6 +119,16 @@ def task(**extra):
 
 
 class GatewayWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claim_read_timeout_does_not_stop_worker(self):
+        api = FakeAPI()
+        api.claim = AsyncMock(
+            side_effect=[httpx.ReadTimeout("temporary timeout"), None]
+        )
+
+        await GatewayWorker(settings(), api, FakeGateway([])).run(once=True)
+
+        self.assertEqual(2, api.claim.await_count)
+
     async def test_registers_structured_remote_routes(self):
         api = FakeAPI()
         gateway = FakeGateway([])

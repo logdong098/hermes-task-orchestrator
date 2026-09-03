@@ -7,14 +7,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from hermes.config import CoordinatorSettings, UnifiedWorkerSettings, WorkerSettings
 from hermes.coordinator import create_app
 from hermes.storage import SQLiteStore
-from hermes.worker import UnifiedWorkerRuntime, WorkerAPI, WorkerRuntime
+from hermes.worker import (
+    UnifiedWorkerRuntime,
+    WorkerAPI,
+    WorkerRuntime,
+    resolve_command_for_platform,
+)
 
 
 class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -85,6 +90,48 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("command", worker["worker_kind"])
         self.assertEqual("codex", worker["default_agent"])
         self.assertEqual("codex", worker["routes"][0]["default_agent"])
+
+    async def test_command_worker_retries_after_claim_read_timeout(self) -> None:
+        runtime = WorkerRuntime(self.worker_settings, self.api)
+        claim = AsyncMock(side_effect=[httpx.ReadTimeout("temporary timeout"), None])
+        with patch.object(self.api, "claim", claim):
+            await runtime.run(once=True)
+
+        self.assertEqual(2, claim.await_count)
+
+    async def test_unified_worker_retries_after_claim_read_timeout(self) -> None:
+        settings = UnifiedWorkerSettings(
+            coordinator_url="http://test",
+            worker_id="unified-timeout-worker",
+            worker_name="Unified Timeout Worker",
+            shared_secret="worker-test-secret",
+            default_agent="codex",
+            command=[sys.executable, "-c", "print('unused')", "{prompt}"],
+            agent_commands={
+                "codex": [sys.executable, "-c", "print('unused')", "{prompt}"]
+            },
+            allowed_workdir=self.temporary_directory.name,
+            gateway_url="",
+            gateway_id="",
+            poll_interval_seconds=0,
+        )
+        runtime = UnifiedWorkerRuntime(settings, self.api)
+        claim = AsyncMock(side_effect=[httpx.ReadTimeout("temporary timeout"), None])
+        with patch.object(self.api, "claim", claim):
+            await runtime.run(once=True)
+
+        self.assertEqual(2, claim.await_count)
+
+    async def test_windows_command_shim_is_resolved_before_spawn(self) -> None:
+        resolved = r"C:\Users\worker\AppData\Roaming\npm\claude.cmd"
+        with (
+            patch("hermes.worker.os.name", "nt"),
+            patch("hermes.worker.shutil.which", return_value=resolved) as which,
+        ):
+            command = resolve_command_for_platform(["claude", "-p", "prompt"])
+
+        self.assertEqual([resolved, "-p", "prompt"], command)
+        which.assert_called_once_with("claude")
 
     async def test_workdir_escape_and_bypass_are_rejected(self) -> None:
         runtime = WorkerRuntime(self.worker_settings, self.api)
